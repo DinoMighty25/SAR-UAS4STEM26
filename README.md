@@ -1,3 +1,11 @@
+# SAR-UAS4STEM26 - QR Landing Target Detection
+
+Some Assembly Required's github repository for the 25-26 UAS4STEM season
+
+This folder contains the QR code detection and landing target calculation system for autonomous landing.
+
+---
+
 # QRDet
 **QRDet** is a robust **QR Detector** based on <a href="https://github.com/ultralytics/ultralytics" target="_blank">YOLOv8</a>.
 
@@ -69,6 +77,13 @@ cv2.imwrite(filename='resources/qreader_test_image_detections.jpeg', img=image)
 > - All `np.ndarray` values are of type `np.float32` 
 > - All keys (except `confidence` and `image_shape`) have a normalized ('n') version. For example,`bbox_xyxy` represents the bbox of the QR in image coordinates [[0., im_w], [0., im_h]], while `bbox_xyxyn` contains the same bounding box in normalized coordinates [0., 1.].
 > - `bbox_xyxy[n]` and `polygon_xy[n]` are clipped to `image_shape`. You can use them for indexing without further management
+
+## Landing Target Detection
+
+The `main.py` file contains code for:
+- Real-time QR code detection from video feed
+- Calculation of landing target parameters (angle_x, angle_y, distance, size_x, size_y)
+- MAVLink integration for sending landing target messages to ArduPilot
 
 ## Acknowledgements
 
