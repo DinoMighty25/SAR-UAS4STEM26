@@ -11,13 +11,13 @@ import numpy as np
 # Camera setup
 CAMERA_HFOV = math.radians(78)
 CAMERA_VFOV = math.radians(60)
-QR_SIZE_METERS = 0.2  # Actual QR code size - IMPORTANT: measure and update this!
+QR_SIZE_METERS = 0.2  # Actual QR code size in meters (change if needed)
 
 # Detection
 CONFIDENCE_THRESHOLD = 0.3
-MODEL_PATH = "/home/drone/SAR-rpk/qrdet_final2.rpk"
+MODEL_PATH = "/home/drone/SAR-rpk/qrdet_final2.rpk" # Make sure .rpk IMX500 AI model is downloaded and path is corrected
 
-# MAVLink
+# MAVLink (make sure port & baud rate is proper)
 PIXHAWK_PORT = '/dev/ttyAMA0'
 PIXHAWK_BAUD = 57600
 MESSAGE_RATE_HZ = 10
@@ -26,7 +26,7 @@ MESSAGE_RATE_HZ = 10
 MODEL_INPUT_WIDTH = 512
 MODEL_INPUT_HEIGHT = 512
 
-DEBUG = True
+DEBUG = True # debug print stuff
 
 
 def initialize_imx500(model_path):
