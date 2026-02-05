@@ -12,14 +12,14 @@ import time
 import math
 import numpy as np
 
-# Camera setup
+# camera setup
 CAMERA_HFOV = math.radians(78)
 CAMERA_VFOV = math.radians(60)
-QR_SIZE_METERS = 0.2  # Actual QR code size - IMPORTANT: measure and update this!
+QR_SIZE_METERS = 0.2  # qr code size in meters
 
-# Detection
+# detection
 CONFIDENCE_THRESHOLD = 0.3
-MODEL_PATH = "/home/drone/SAR-rpk/qrdet_final2.rpk" # .rpk file contains the IMX500 model format
+MODEL_PATH = "/home/drone/SAR-rpk/qrdet_final2.rpk" # .rpk file contains the IMX500 model format, make it the right path
 
 # MAVLink
 PIXHAWK_PORT = '/dev/ttyAMA0'
@@ -31,7 +31,7 @@ RC_CHANNEL = 6
 RC_ENABLE_VALUE = 2065
 RC_TOLERANCE = 50
 
-# Model resolution - basically so that the bounding box maps onto the camera's resolution better
+# model resolution - basically so that the bounding box maps onto the camera's resolution better
 MODEL_INPUT_WIDTH = 512
 MODEL_INPUT_HEIGHT = 512
 
@@ -44,7 +44,7 @@ def initialize_imx500(model_path):
     print("Model loaded")
     return imx
 
-# Picamera is launched
+# picamera is launched
 def setup_camera(imx):
     print("Setting up camera...")
     picam2 = Picamera2(imx.camera_num)
@@ -58,7 +58,7 @@ def setup_camera(imx):
     print("Camera ready")
     return picam2
 
-# Pixhawk is connected
+# pixhawk is connected
 def connect_pixhawk():
     print(f"Connecting to Pixhawk on {PIXHAWK_PORT}...")
     try:
@@ -66,7 +66,7 @@ def connect_pixhawk():
         master.wait_heartbeat()
         print("Connected to Pixhawk")
         
-        # Request RC channel data stream
+        # request RC channel data stream
         master.mav.request_data_stream_send(
             master.target_system,
             master.target_component,
@@ -112,7 +112,7 @@ def parse_detections(imx, metadata, img_width, img_height, conf_threshold):
     bboxes = outputs[0]
     scores = outputs[1]
     
-    # Get number of detections
+    # get number of detections
     try:
         if len(outputs) > 3:
             num_dets = outputs[3]
@@ -125,7 +125,7 @@ def parse_detections(imx, metadata, img_width, img_height, conf_threshold):
     except:
         num_detections = len(scores)
     
-    # Scale from model input size to actual image size
+    # scale from model input size to actual image size
     scale_x = img_width / MODEL_INPUT_WIDTH
     scale_y = img_height / MODEL_INPUT_HEIGHT
     
@@ -135,14 +135,14 @@ def parse_detections(imx, metadata, img_width, img_height, conf_threshold):
         if conf < conf_threshold:
             continue
         
-        # Scale bbox from model space (512x512) to image space (1280x720)
+        # scale bbox from model space (512x512) to image space (1280x720)
         x1, y1, x2, y2 = [float(v) for v in bboxes[i]]
         x1 *= scale_x
         x2 *= scale_x
         y1 *= scale_y
         y2 *= scale_y
         
-        # Clamp to image bounds
+        # clamp to image bounds
         x1 = max(0, min(x1, img_width))
         x2 = max(0, min(x2, img_width))
         y1 = max(0, min(y1, img_height))
@@ -171,19 +171,19 @@ def calculate_landing_target(detection, img_width, img_height):
     if width <= 0 or height <= 0:
         return None
     
-    # Offset from center, normalized to [-1, 1]
+    # offset from center, normalized to [-1, 1]
     offset_x = (cx - img_width / 2) / (img_width / 2)
     offset_y = (cy - img_height / 2) / (img_height / 2)
     
-    # Convert to angles
+    # convert to angles
     angle_x = offset_x * (CAMERA_HFOV / 2)
     angle_y = offset_y * (CAMERA_VFOV / 2)
     
-    # Angular size
+    # angular size
     size_x = (width / img_width) * CAMERA_HFOV
     size_y = (height / img_height) * CAMERA_VFOV
     
-    # Distance estimate using pinhole camera model
+    # distance estimate using pinhole camera model
     focal_length_px = (img_width / 2) / math.tan(CAMERA_HFOV / 2)
     distance = (QR_SIZE_METERS * focal_length_px) / width
     
@@ -217,13 +217,13 @@ def draw_detection(frame, detection, angle_x, angle_y, distance, enabled):
     
     color = (0, 255, 0) if enabled else (0, 255, 255)  # green if active, yellow if not
     
-    # Bounding box
+    # bounding box
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     
-    # Center crosshair
+    # center crosshair
     cv2.drawMarker(frame, (cx, cy), color, cv2.MARKER_CROSS, 20, 2)
     
-    # Image center reference
+    # image center reference
     img_cx = frame.shape[1] // 2
     img_cy = frame.shape[0] // 2
     cv2.drawMarker(frame, (img_cx, img_cy), (255, 0, 0), cv2.MARKER_CROSS, 30, 2)
@@ -267,7 +267,7 @@ def main():
                 metadata = request.get_metadata()
                 img_h, img_w = frame.shape[:2]
                 
-                # Check RC switch - only update state when we get new data
+                # check RC switch - only update state when we get new data
                 new_enabled, rc_val = check_rc_switch(master)
                 if rc_val is not None:
                     last_rc_val = rc_val
@@ -276,7 +276,7 @@ def main():
                 detections = parse_detections(imx, metadata, img_w, img_h, CONFIDENCE_THRESHOLD)
                 current_time = time.time()
                 
-                # Show RC status on screen
+                # show RC status on screen
                 if last_rc_val is not None:
                     status_color = (0, 255, 0) if rc_enabled else (0, 0, 255)
                     status_txt = "ON" if rc_enabled else "OFF"
@@ -305,7 +305,7 @@ def main():
                             print(f"  Angle: {math.degrees(angle_x):+.1f}°, "
                                   f"{math.degrees(angle_y):+.1f}°, Dist: {distance:.2f}m")
                         
-                        # Send to Pixhawk at specified rate ONLY if RC switch enabled
+                        # send to Pixhawk at specified rate if rc is enabled
                         if rc_enabled and master and (current_time - last_msg_time) >= min_msg_interval:
                             try:
                                 send_landing_target(master, angle_x, angle_y, distance, size_x, size_y)
