@@ -1,0 +1,7 @@
+ultralytics
+quadrilateral-fitter
+
+numpy
+requests
+#sympy==1.11.1
+tqdm
