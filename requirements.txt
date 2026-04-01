@@ -1,0 +1,5 @@
+picamera2
+opencv-python
+pymavlink
+pyzbar
+numpy
