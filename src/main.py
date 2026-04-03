@@ -16,7 +16,7 @@ from precision_land import (
 )
 
 CONFIDENCE_THRESHOLD = 0.3
-MODEL_PATH = "/home/drone/SAR-rpk/qrdet_final2.rpk"
+MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
 
 MODEL_INPUT_WIDTH = 512
 MODEL_INPUT_HEIGHT = 512
