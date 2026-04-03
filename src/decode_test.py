@@ -96,7 +96,7 @@ def parse_detections(imx, picam2, metadata, img_width, img_height):
         if has_masks and i < len(mask_coeffs):
             polygon = _extract_polygon(
                 mask_coeffs[i], mask_protos,
-                (x1, y1, x2, y2), img_width, img_height
+                imx, picam2, metadata, img_width, img_height
             )
 
         detections.append({
@@ -109,7 +109,7 @@ def parse_detections(imx, picam2, metadata, img_width, img_height):
     return detections
 
 
-def _extract_polygon(coefficients, protos, bbox, img_w, img_h):
+def _extract_polygon(coefficients, protos, imx, picam2, metadata, img_w, img_h):
     try:
         proto_h, proto_w = protos.shape[1], protos.shape[2]
 
@@ -117,19 +117,11 @@ def _extract_polygon(coefficients, protos, bbox, img_w, img_h):
         mask = mask.reshape(proto_h, proto_w)
         mask = 1.0 / (1.0 + np.exp(-mask))
 
-        x1, y1, x2, y2 = bbox
-        scale_x = proto_w / img_w
-        scale_y = proto_h / img_h
-        px1 = max(0, int(x1 * scale_x))
-        py1 = max(0, int(y1 * scale_y))
-        px2 = min(proto_w, int(x2 * scale_x))
-        py2 = min(proto_h, int(y2 * scale_y))
+        binary = (mask > 0.5).astype(np.uint8) * 255
 
-        cropped = np.zeros_like(mask)
-        cropped[py1:py2, px1:px2] = mask[py1:py2, px1:px2]
-
-        binary = (cropped > 0.5).astype(np.uint8) * 255
-        binary = cv2.resize(binary, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+        # resize to model input size first, then we'll map contour points
+        binary = cv2.resize(binary, (MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT),
+                            interpolation=cv2.INTER_LINEAR)
         _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
 
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -142,8 +134,27 @@ def _extract_polygon(coefficients, protos, bbox, img_w, img_h):
 
         epsilon = 0.015 * cv2.arcLength(cnt, True)
         cnt = cv2.approxPolyDP(cnt, epsilon, True)
+        pts = cnt.reshape(-1, 2).astype(np.float32)
 
-        return cnt.reshape(-1, 2).astype(np.float32)
+        # convert each contour point from model coords to image coords
+        # using the same function that correctly maps bboxes
+        converted = []
+        for pt in pts:
+            px, py = float(pt[0]), float(pt[1])
+            rel_x = px / MODEL_INPUT_WIDTH
+            rel_y = py / MODEL_INPUT_HEIGHT
+            # convert_inference_coords expects (y1, x1, y2, x2) relative,
+            # returns (x, y, w, h). use a tiny box around the point.
+            eps = 0.001
+            x, y, w, h = imx.convert_inference_coords(
+                (rel_y - eps, rel_x - eps, rel_y + eps, rel_x + eps),
+                metadata, picam2
+            )
+            img_x = np.clip(x + w / 2, 0, img_w - 1)
+            img_y = np.clip(y + h / 2, 0, img_h - 1)
+            converted.append([img_x, img_y])
+
+        return np.float32(converted)
 
     except Exception:
         return None
