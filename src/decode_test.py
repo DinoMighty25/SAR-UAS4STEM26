@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 from picamera2 import Picamera2
-from picamera2.devices.imx500 import IMX500
+from picamera2.devices import IMX500
+from picamera2.devices.imx500 import NetworkIntrinsics
 import cv2
 import threading
 import queue
@@ -13,25 +14,43 @@ from qr_decode import safe_crop, try_decode_crop
 CONFIDENCE_THRESHOLD = 0.3
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
 
-MODEL_INPUT_WIDTH = 512
-MODEL_INPUT_HEIGHT = 512
-
-# how long a decoded result stays on screen after detection disappears (seconds)
-RESULT_PERSIST_SEC = 1.0
+# How long a decoded result stays on screen after detection disappears (seconds)
+RESULT_PERSIST_SEC = 3.0
 
 
 def initialize_imx500(model_path):
     print("loading model...")
+    # IMX500 must be instantiated BEFORE Picamera2
     imx = IMX500(model_path)
+    intrinsics = imx.network_intrinsics
+    if not intrinsics:
+        intrinsics = NetworkIntrinsics()
+        intrinsics.task = "object detection"
+    intrinsics.update_with_defaults()
     print("model loaded")
-    return imx
+    print(f"  input size: {imx.get_input_size()}")
+    print(f"  intrinsics task: {intrinsics.task}")
+    if hasattr(intrinsics, 'bbox_normalization'):
+        print(f"  bbox_normalization: {intrinsics.bbox_normalization}")
+    if hasattr(intrinsics, 'bbox_order'):
+        print(f"  bbox_order: {intrinsics.bbox_order}")
+    return imx, intrinsics
 
 
-def setup_camera(imx):
+def setup_camera(imx, intrinsics):
     print("starting camera...")
     picam2 = Picamera2(imx.camera_num)
+
+    # Use buffer_count=12 for reliable metadata sync (matches official demos)
+    # Set FrameRate from intrinsics if available
+    controls = {}
+    if intrinsics.inference_rate is not None:
+        controls["FrameRate"] = intrinsics.inference_rate
+
     config = picam2.create_preview_configuration(
-        main={"size": (1280, 720), "format": "RGB888"}
+        main={"size": (1280, 720), "format": "RGB888"},
+        controls=controls,
+        buffer_count=12
     )
     imx.show_network_fw_progress_bar()
     picam2.configure(config)
@@ -41,14 +60,43 @@ def setup_camera(imx):
     return picam2
 
 
-def parse_detections(imx, picam2, metadata, img_width, img_height, conf_threshold):
-    outputs = imx.get_outputs(metadata, add_batch=False)
-    if outputs is None or len(outputs) < 3:
+def parse_detections(imx, picam2, metadata, conf_threshold):
+    """Parse model outputs into detections with correct coordinate conversion.
+
+    convert_inference_coords expects:
+        coords: (y0, x0, y1, x1) — all values NORMALIZED to 0.0-1.0 range
+    It returns:
+        (x, y, w, h) — in ISP output (main stream) pixel coordinates
+
+    The function internally:
+        1. Unpacks as: y0, x0, y1, x1 = coords
+        2. Scales to full sensor resolution (4056x3040)
+        3. Maps through ScalerCrop to ISP output coordinates
+    """
+    # Use add_batch=True to match official demo tensor shapes
+    outputs = imx.get_outputs(metadata, add_batch=True)
+    if outputs is None:
         return []
 
-    bboxes = outputs[0]
-    scores = outputs[1]
+    # Get the actual model input dimensions from the firmware
+    input_w, input_h = imx.get_input_size()
 
+    # Check intrinsics for bbox format info
+    intrinsics = imx.network_intrinsics
+    bbox_order = getattr(intrinsics, 'bbox_order', 'yx') if intrinsics else 'yx'
+    bbox_normalization = getattr(intrinsics, 'bbox_normalization', False) if intrinsics else False
+
+    # With add_batch=True, outputs[0] has shape (1, N, 4), outputs[1] has shape (1, N)
+    # Index [0] to remove the batch dimension
+    try:
+        bboxes = outputs[0][0]   # shape: (N, 4)
+        scores = outputs[1][0]   # shape: (N,)
+    except (IndexError, TypeError):
+        # Fallback: try without batch indexing
+        bboxes = outputs[0]
+        scores = outputs[1]
+
+    # Determine number of valid detections
     try:
         if len(outputs) > 3:
             num_dets = outputs[3]
@@ -58,29 +106,57 @@ def parse_detections(imx, picam2, metadata, img_width, img_height, conf_threshol
     except Exception:
         num_detections = len(scores)
 
+    # Normalize bboxes to 0.0-1.0 range if the intrinsics say so
+    # Official demo: if bbox_normalization flag is set, divides by input_h
+    if bbox_normalization:
+        bboxes = bboxes / input_h
+
     detections = []
     for i in range(min(num_detections, len(bboxes))):
         conf = float(scores[i])
         if conf < conf_threshold:
             continue
 
-        raw_x1, raw_y1, raw_x2, raw_y2 = [float(v) for v in bboxes[i]]
-        rel_x1 = raw_x1 / MODEL_INPUT_WIDTH
-        rel_y1 = raw_y1 / MODEL_INPUT_HEIGHT
-        rel_x2 = raw_x2 / MODEL_INPUT_WIDTH
-        rel_y2 = raw_y2 / MODEL_INPUT_HEIGHT
+        box = bboxes[i]
 
-        x, y, w, h = imx.convert_inference_coords(
-            (rel_y1, rel_x1, rel_y2, rel_x2), metadata, picam2
-        )
+        # Handle bbox ordering:
+        # Default IMX500 order is "yx": (y0, x0, y1, x1)
+        # Some models use "xy": (x0, y0, x1, y1) — need to swap to yx
+        if bbox_order == "xy":
+            # Model gives (x0, y0, x1, y1), convert to (y0, x0, y1, x1)
+            coords = (float(box[1]), float(box[0]), float(box[3]), float(box[2]))
+        else:
+            # Model already gives (y0, x0, y1, x1) — pass through
+            coords = tuple(float(v) for v in box)
 
-        x1 = max(0, min(x, img_width))
-        y1 = max(0, min(y, img_height))
-        x2 = max(0, min(x + w, img_width))
-        y2 = max(0, min(y + h, img_height))
+        # ── CUSTOM MODEL NORMALIZATION ──
+        # If your model outputs raw pixel coordinates (0-512 range) rather than
+        # normalized coords, we need to normalize them here.
+        # The official demo normalizes by dividing by input_h when bbox_normalization
+        # is True. For custom models without that flag, check the magnitude.
+        max_coord = max(abs(c) for c in coords)
+        if max_coord > 1.5:
+            # Coords are in pixel space, normalize to 0.0-1.0
+            coords = (
+                coords[0] / input_h,   # y0
+                coords[1] / input_w,   # x0
+                coords[2] / input_h,   # y1
+                coords[3] / input_w,   # x1
+            )
+
+        # convert_inference_coords maps normalized (y0,x0,y1,x1) -> ISP pixel (x,y,w,h)
+        try:
+            x, y, w, h = imx.convert_inference_coords(coords, metadata, picam2)
+        except Exception as e:
+            print(f"coord conversion error: {e}")
+            continue
+
+        # Sanity check: skip nonsensical boxes
+        if w <= 0 or h <= 0:
+            continue
 
         detections.append({
-            'bbox': (int(x1), int(y1), int(x2), int(y2)),
+            'bbox': (int(x), int(y), int(x + w), int(y + h)),
             'confidence': conf
         })
 
@@ -121,8 +197,8 @@ def decode_worker(decode_q, result_holder, result_lock):
 
 
 def main():
-    imx = initialize_imx500(MODEL_PATH)
-    picam2 = setup_camera(imx)
+    imx, intrinsics = initialize_imx500(MODEL_PATH)
+    picam2 = setup_camera(imx, intrinsics)
 
     decode_q = queue.Queue(maxsize=1)
     result_holder = {'text': None, 'last_decode_time': 0.0}
@@ -140,11 +216,10 @@ def main():
             try:
                 frame = request.make_array("main")
                 metadata = request.get_metadata()
-                img_h, img_w = frame.shape[:2]
 
-                detections = parse_detections(imx, picam2, metadata, img_w, img_h, CONFIDENCE_THRESHOLD)
+                detections = parse_detections(imx, picam2, metadata, CONFIDENCE_THRESHOLD)
 
-                # FIX: read the persisted result once per frame
+                # Read the persisted decode result once per frame
                 with result_lock:
                     decoded_text = result_holder['text']
                     last_time = result_holder['last_decode_time']
@@ -152,25 +227,25 @@ def main():
                 if detections:
                     detection_count += 1
 
-                    # FIX: try ALL detections, not just the first one.
-                    # Submit the highest-confidence crop that isn't already queued.
+                    # Submit highest-confidence crop for decoding
                     for detection in detections:
                         x1, y1, x2, y2 = detection['bbox']
                         crop = safe_crop(frame, x1, y1, x2, y2)
                         if crop is not None and crop.size > 0:
                             try:
                                 decode_q.put_nowait(crop.copy())
-                                break  # submitted one crop, move on
+                                break
                             except queue.Full:
-                                break  # worker is busy, don't block
+                                break
 
-                    # draw all detections
+                    # Draw all detections
                     for detection in detections:
                         draw_detection(frame, detection, decoded_text)
 
                     cv2.putText(frame, f"detections: {detection_count}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
+                    # Let decoded text persist for a few seconds after detection disappears
                     if decoded_text and (time.monotonic() - last_time > RESULT_PERSIST_SEC):
                         with result_lock:
                             result_holder['text'] = None
