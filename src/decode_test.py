@@ -14,13 +14,11 @@ from qr_decode import safe_crop, try_decode_crop
 CONFIDENCE_THRESHOLD = 0.3
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
 
-# How long a decoded result stays on screen after detection disappears (seconds)
 RESULT_PERSIST_SEC = 3.0
 
 
 def initialize_imx500(model_path):
     print("loading model...")
-    # IMX500 must be instantiated BEFORE Picamera2
     imx = IMX500(model_path)
     intrinsics = imx.network_intrinsics
     if not intrinsics:
@@ -40,9 +38,6 @@ def initialize_imx500(model_path):
 def setup_camera(imx, intrinsics):
     print("starting camera...")
     picam2 = Picamera2(imx.camera_num)
-
-    # Use buffer_count=12 for reliable metadata sync (matches official demos)
-    # Set FrameRate from intrinsics if available
     controls = {}
     if intrinsics.inference_rate is not None:
         controls["FrameRate"] = intrinsics.inference_rate
@@ -73,15 +68,14 @@ def parse_detections(imx, picam2, metadata, conf_threshold):
         2. Scales to full sensor resolution (4056x3040)
         3. Maps through ScalerCrop to ISP output coordinates
     """
-    # Use add_batch=True to match official demo tensor shapes
     outputs = imx.get_outputs(metadata, add_batch=True)
     if outputs is None:
         return []
 
-    # Get the actual model input dimensions from the firmware
+    # get the actual model input dimensions from the firmware
     input_w, input_h = imx.get_input_size()
 
-    # Check intrinsics for bbox format info
+    # check intrinsics for bbox format info
     intrinsics = imx.network_intrinsics
     bbox_order = getattr(intrinsics, 'bbox_order', 'yx') if intrinsics else 'yx'
     bbox_normalization = getattr(intrinsics, 'bbox_normalization', False) if intrinsics else False
@@ -92,7 +86,6 @@ def parse_detections(imx, picam2, metadata, conf_threshold):
         bboxes = outputs[0][0]   # shape: (N, 4)
         scores = outputs[1][0]   # shape: (N,)
     except (IndexError, TypeError):
-        # Fallback: try without batch indexing
         bboxes = outputs[0]
         scores = outputs[1]
 
@@ -129,14 +122,8 @@ def parse_detections(imx, picam2, metadata, conf_threshold):
             # Model already gives (y0, x0, y1, x1) — pass through
             coords = tuple(float(v) for v in box)
 
-        # ── CUSTOM MODEL NORMALIZATION ──
-        # If your model outputs raw pixel coordinates (0-512 range) rather than
-        # normalized coords, we need to normalize them here.
-        # The official demo normalizes by dividing by input_h when bbox_normalization
-        # is True. For custom models without that flag, check the magnitude.
         max_coord = max(abs(c) for c in coords)
         if max_coord > 1.5:
-            # Coords are in pixel space, normalize to 0.0-1.0
             coords = (
                 coords[0] / input_h,   # y0
                 coords[1] / input_w,   # x0
@@ -151,7 +138,6 @@ def parse_detections(imx, picam2, metadata, conf_threshold):
             print(f"coord conversion error: {e}")
             continue
 
-        # Sanity check: skip nonsensical boxes
         if w <= 0 or h <= 0:
             continue
 
@@ -219,7 +205,7 @@ def main():
 
                 detections = parse_detections(imx, picam2, metadata, CONFIDENCE_THRESHOLD)
 
-                # Read the persisted decode result once per frame
+                # read the persisted decode result once per frame
                 with result_lock:
                     decoded_text = result_holder['text']
                     last_time = result_holder['last_decode_time']
@@ -227,7 +213,7 @@ def main():
                 if detections:
                     detection_count += 1
 
-                    # Submit highest-confidence crop for decoding
+                    # submit highest-confidence crop for decoding
                     for detection in detections:
                         x1, y1, x2, y2 = detection['bbox']
                         crop = safe_crop(frame, x1, y1, x2, y2)
@@ -238,14 +224,14 @@ def main():
                             except queue.Full:
                                 break
 
-                    # Draw all detections
+                    # draw all detections
                     for detection in detections:
                         draw_detection(frame, detection, decoded_text)
 
                     cv2.putText(frame, f"detections: {detection_count}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
-                    # Let decoded text persist for a few seconds after detection disappears
+                    # let decoded text persist for a few seconds after detection disappears
                     if decoded_text and (time.monotonic() - last_time > RESULT_PERSIST_SEC):
                         with result_lock:
                             result_holder['text'] = None
