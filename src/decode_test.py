@@ -13,7 +13,8 @@ from qr_decode import safe_crop, try_decode_crop
 
 CONFIDENCE_THRESHOLD = 0.3
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
-
+QR_CLASS_ID = 1       # 0=background, 1=QR — adjust to match your model
+MIN_MASK_AREA = 100   # minimum mask pixels for a valid detection
 RESULT_PERSIST_SEC = 3.0
 
 
@@ -23,21 +24,18 @@ def initialize_imx500(model_path):
     intrinsics = imx.network_intrinsics
     if not intrinsics:
         intrinsics = NetworkIntrinsics()
-        intrinsics.task = "object detection"
+        intrinsics.task = "segmentation"
     intrinsics.update_with_defaults()
-    print("model loaded")
-    print(f"  input size: {imx.get_input_size()}")
-    print(f"  intrinsics task: {intrinsics.task}")
-    if hasattr(intrinsics, 'bbox_normalization'):
-        print(f"  bbox_normalization: {intrinsics.bbox_normalization}")
-    if hasattr(intrinsics, 'bbox_order'):
-        print(f"  bbox_order: {intrinsics.bbox_order}")
+
+    input_w, input_h = imx.get_input_size()
+    print(f"model loaded  input={input_w}x{input_h}  task={getattr(intrinsics, 'task', '?')}")
     return imx, intrinsics
 
 
 def setup_camera(imx, intrinsics):
     print("starting camera...")
     picam2 = Picamera2(imx.camera_num)
+
     controls = {}
     if intrinsics.inference_rate is not None:
         controls["FrameRate"] = intrinsics.inference_rate
@@ -55,83 +53,84 @@ def setup_camera(imx, intrinsics):
     return picam2
 
 
-def parse_detections(imx, picam2, metadata, conf_threshold):
-    """Parse model outputs into detections with correct coordinate conversion.
+_diagnosed = False
 
-    convert_inference_coords expects:
-        coords: (y0, x0, y1, x1) — all values NORMALIZED to 0.0-1.0 range
-    It returns:
-        (x, y, w, h) — in ISP output (main stream) pixel coordinates
+def diagnose_outputs(outputs):
+    """Print tensor info once on first frame — helps debug custom models."""
+    global _diagnosed
+    if _diagnosed:
+        return
+    _diagnosed = True
 
-    The function internally:
-        1. Unpacks as: y0, x0, y1, x1 = coords
-        2. Scales to full sensor resolution (4056x3040)
-        3. Maps through ScalerCrop to ISP output coordinates
-    """
-    outputs = imx.get_outputs(metadata, add_batch=True)
+    print(f"\n=== MODEL OUTPUTS ({len(outputs)} tensors) ===")
+    for i, out in enumerate(outputs):
+        arr = np.array(out)
+        unique = np.unique(arr)
+        extra = f"unique={unique}" if len(unique) <= 20 else f"{len(unique)} unique values"
+        print(f"  [{i}] shape={arr.shape} dtype={arr.dtype} range=[{arr.min():.4f}, {arr.max():.4f}] {extra}")
+    print("===\n")
+
+
+def mask_to_detections(imx, picam2, metadata, qr_class_id=QR_CLASS_ID):
+    """Extract bounding boxes from the segmentation mask output."""
+    outputs = imx.get_outputs(metadata, add_batch=False)
     if outputs is None:
         return []
 
-    # get the actual model input dimensions from the firmware
+    diagnose_outputs(outputs)
     input_w, input_h = imx.get_input_size()
+    mask = np.array(outputs[0])
 
-    # check intrinsics for bbox format info
-    intrinsics = imx.network_intrinsics
-    bbox_order = getattr(intrinsics, 'bbox_order', 'yx') if intrinsics else 'yx'
-    bbox_normalization = getattr(intrinsics, 'bbox_normalization', False) if intrinsics else False
-
-    # With add_batch=True, outputs[0] has shape (1, N, 4), outputs[1] has shape (1, N)
-    # Index [0] to remove the batch dimension
-    try:
-        bboxes = outputs[0][0]   # shape: (N, 4)
-        scores = outputs[1][0]   # shape: (N,)
-    except (IndexError, TypeError):
-        bboxes = outputs[0]
-        scores = outputs[1]
-
-    # Determine number of valid detections
-    try:
-        if len(outputs) > 3:
-            num_dets = outputs[3]
-            num_detections = int(num_dets.item() if hasattr(num_dets, 'item') else num_dets.flatten()[0])
+    # collapse to 2D class map regardless of output layout
+    if mask.ndim == 3:
+        if mask.shape[0] == 1:
+            mask = mask[0]
+        elif mask.shape[2] == 1:
+            mask = mask[:, :, 0]
+        elif mask.shape[0] <= 4:
+            mask = np.argmax(mask, axis=0)
         else:
-            num_detections = len(scores)
-    except Exception:
-        num_detections = len(scores)
+            mask = np.argmax(mask, axis=2)
+    elif mask.ndim == 4:
+        mask = mask[0]
+        if mask.shape[0] <= 4:
+            mask = np.argmax(mask, axis=0)
+        else:
+            mask = np.argmax(mask, axis=2)
 
-    # Normalize bboxes to 0.0-1.0 range if the intrinsics say so
-    # Official demo: if bbox_normalization flag is set, divides by input_h
-    if bbox_normalization:
-        bboxes = bboxes / input_h
+    # build binary mask for the QR class
+    if mask.dtype in (np.float32, np.float64):
+        if mask.max() <= 1.0:
+            binary = (mask > 0.5).astype(np.uint8)
+        else:
+            binary = (mask.astype(int) == qr_class_id).astype(np.uint8)
+    else:
+        binary = (mask == qr_class_id).astype(np.uint8)
 
+    # fallback: any non-background pixel (in case class id is wrong)
+    if binary.sum() == 0:
+        binary = (mask > 0).astype(np.uint8)
+        if binary.sum() == 0:
+            return []
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    mask_h, mask_w = binary.shape
     detections = []
-    for i in range(min(num_detections, len(bboxes))):
-        conf = float(scores[i])
-        if conf < conf_threshold:
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < MIN_MASK_AREA:
             continue
 
-        box = bboxes[i]
+        mx, my, mw, mh = cv2.boundingRect(contour)
 
-        # Handle bbox ordering:
-        # Default IMX500 order is "yx": (y0, x0, y1, x1)
-        # Some models use "xy": (x0, y0, x1, y1) — need to swap to yx
-        if bbox_order == "xy":
-            # Model gives (x0, y0, x1, y1), convert to (y0, x0, y1, x1)
-            coords = (float(box[1]), float(box[0]), float(box[3]), float(box[2]))
-        else:
-            # Model already gives (y0, x0, y1, x1) — pass through
-            coords = tuple(float(v) for v in box)
+        # normalize to 0-1 then convert to ISP output coords
+        # convert_inference_coords expects (y0, x0, y1, x1) normalized
+        coords = (my / mask_h, mx / mask_w, (my + mh) / mask_h, (mx + mw) / mask_w)
 
-        max_coord = max(abs(c) for c in coords)
-        if max_coord > 1.5:
-            coords = (
-                coords[0] / input_h,   # y0
-                coords[1] / input_w,   # x0
-                coords[2] / input_h,   # y1
-                coords[3] / input_w,   # x1
-            )
-
-        # convert_inference_coords maps normalized (y0,x0,y1,x1) -> ISP pixel (x,y,w,h)
         try:
             x, y, w, h = imx.convert_inference_coords(coords, metadata, picam2)
         except Exception as e:
@@ -141,12 +140,17 @@ def parse_detections(imx, picam2, metadata, conf_threshold):
         if w <= 0 or h <= 0:
             continue
 
+        bbox_area = mw * mh
+        fill_ratio = area / bbox_area if bbox_area > 0 else 0
+        confidence = min(fill_ratio + 0.3, 1.0)
+
         detections.append({
             'bbox': (int(x), int(y), int(x + w), int(y + h)),
-            'confidence': conf
+            'confidence': round(confidence, 2),
+            'mask_area': int(area)
         })
 
-    detections.sort(key=lambda d: d['confidence'], reverse=True)
+    detections.sort(key=lambda d: d['mask_area'], reverse=True)
     return detections
 
 
@@ -155,7 +159,7 @@ def draw_detection(frame, detection, decoded_text=None):
     color = (0, 255, 0) if decoded_text else (0, 165, 255)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, f"conf: {detection['confidence']:.2f}",
+    cv2.putText(frame, f"area: {detection.get('mask_area', '?')}",
                 (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     if decoded_text:
@@ -164,7 +168,6 @@ def draw_detection(frame, detection, decoded_text=None):
 
 
 def decode_worker(decode_q, result_holder, result_lock):
-    """Background thread that decodes QR crops from the queue."""
     while True:
         try:
             crop = decode_q.get(timeout=1)
@@ -203,9 +206,8 @@ def main():
                 frame = request.make_array("main")
                 metadata = request.get_metadata()
 
-                detections = parse_detections(imx, picam2, metadata, CONFIDENCE_THRESHOLD)
+                detections = mask_to_detections(imx, picam2, metadata)
 
-                # read the persisted decode result once per frame
                 with result_lock:
                     decoded_text = result_holder['text']
                     last_time = result_holder['last_decode_time']
@@ -213,7 +215,6 @@ def main():
                 if detections:
                     detection_count += 1
 
-                    # submit highest-confidence crop for decoding
                     for detection in detections:
                         x1, y1, x2, y2 = detection['bbox']
                         crop = safe_crop(frame, x1, y1, x2, y2)
@@ -224,14 +225,12 @@ def main():
                             except queue.Full:
                                 break
 
-                    # draw all detections
                     for detection in detections:
                         draw_detection(frame, detection, decoded_text)
 
                     cv2.putText(frame, f"detections: {detection_count}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
-                    # let decoded text persist for a few seconds after detection disappears
                     if decoded_text and (time.monotonic() - last_time > RESULT_PERSIST_SEC):
                         with result_lock:
                             result_holder['text'] = None
