@@ -190,6 +190,8 @@ def _fp_score(gray, center, radius):
     best = 0.0
     for block_sz, thresh_c in [(31, 10), (51, 5), (21, 15)]:
         block_sz = min(block_sz, max(3, min(patch.shape) // 2 * 2 - 1))
+        if block_sz < 3:
+            continue
         binary = cv2.adaptiveThreshold(
             patch, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY, block_sz, thresh_c)
@@ -203,9 +205,22 @@ def _pick_p4(gray, quad):
     side = (np.linalg.norm(quad[0] - quad[1])
             + np.linalg.norm(quad[1] - quad[2])) / 2
     scores = [_fp_score(gray, corner, side * 0.3) for corner in quad]
+
     p4 = int(np.argmin(scores))
-    if sum(scores[i] > 0.3 for i in range(4) if i != p4) < 2:
-        p4 = 2
+
+    # FIX: require at least 2 other corners to look like finder patterns.
+    # If not, try each corner as P4 (caller will brute-force anyway),
+    # but pick the one whose remaining 3 corners score highest overall.
+    num_good = sum(scores[i] > 0.3 for i in range(4) if i != p4)
+    if num_good < 2:
+        best_combo, best_p4 = -1, 2
+        for candidate in range(4):
+            others = sum(scores[i] for i in range(4) if i != candidate)
+            if others > best_combo:
+                best_combo = others
+                best_p4 = candidate
+        p4 = best_p4
+
     return p4
 
 
@@ -233,8 +248,8 @@ def _refine_p4(gray, quad, p4_idx):
     dir1 = vec1 / (np.linalg.norm(vec1) + 1e-8)
     dir2 = vec2 / (np.linalg.norm(vec2) + 1e-8)
     step = max(1.0, (np.linalg.norm(vec1) + np.linalg.norm(vec2)) / 100)
+
     for direction in (dir1, dir2):
-        cur_dir = direction.copy()
         cur_step = step
         for _ in range(3):
             if cur_step < 0.25:
@@ -242,7 +257,7 @@ def _refine_p4(gray, quad, p4_idx):
             misses = 0
             for __ in range(20):
                 trial = best.copy()
-                trial[p4_idx] += cur_dir * cur_step
+                trial[p4_idx] += direction * cur_step
                 score = _edge_proj_score(gray, trial)
                 if score > best_score:
                     best_score = score
@@ -250,17 +265,79 @@ def _refine_p4(gray, quad, p4_idx):
                     misses = 0
                 else:
                     misses += 1
-                    if misses >= 2:
-                        best[p4_idx] -= cur_dir * cur_step * 2
-                        best_score = _edge_proj_score(gray, best)
-                        cur_dir = -cur_dir
-                        break
+                    if misses >= 3:
+                        break  # FIX: just stop this direction/step combo, don't overshoot
             cur_step /= 2
+
     return best
 
 
+# ── decode helpers (with binarization on warped images) ───────────────────────
+
+def _try_rotations(img):
+    """Try pyzbar at 4 rotations WITH binarization — critical for warped images."""
+    gray = _to_gray(img)
+    for k in range(4):
+        rotated = np.rot90(gray, k) if k else gray
+
+        # raw grayscale
+        t = _pyzbar(rotated)
+        if t:
+            return t
+
+        # Otsu binarization — often needed after perspective warp
+        _, binary = cv2.threshold(rotated, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        t = _pyzbar(binary)
+        if t:
+            return t
+
+        # adaptive threshold — handles uneven lighting from warp
+        adaptive = cv2.adaptiveThreshold(
+            rotated, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2)
+        t = _pyzbar(adaptive)
+        if t:
+            return t
+
+        # inverted — catches light-on-dark QR codes
+        t = _pyzbar(255 - rotated)
+        if t:
+            return t
+
+    return None
+
+
+def _try_warp_with_enhancements(gray, quad, size):
+    """Warp a quad then try multiple decode strategies on the result."""
+    warped = _warp_quad(gray, quad, size)
+    if warped is None:
+        return None
+
+    # padded version often helps pyzbar find the quiet zone
+    padded = _pad(warped, 20)
+
+    t = _try_rotations(padded)
+    if t:
+        return t
+
+    # CLAHE on warped — helps with low-contrast warps
+    clahe = _CLAHE.apply(warped if len(warped.shape) == 2 else _to_gray(warped))
+    t = _try_rotations(_pad(clahe, 20))
+    if t:
+        return t
+
+    # sharpen on warped
+    gray_w = warped if len(warped.shape) == 2 else _to_gray(warped)
+    sharp = cv2.filter2D(gray_w, -1, _SHARPEN_KERNEL)
+    t = _pyzbar(_pad(sharp, 20))
+    if t:
+        return t
+
+    return None
+
+
 def _karrach_warp(gray, poly):
-    """Polygon corners → pick P4 → refine P4 → expand → warp. Returns gray warped image or None."""
+    """Polygon corners → pick P4 → refine P4 → expand → warp. Returns decoded text or None."""
     quad = _polygon_corners(poly)
     if quad is None:
         return None
@@ -270,12 +347,12 @@ def _karrach_warp(gray, poly):
     p4 = _pick_p4(gray, quad)
     refined = _refine_p4(gray, quad, p4)
     ordered = np.roll(refined, -((p4 - 2) % 4), axis=0)
-    big = _expand_quad(ordered, 0.12)
 
-    for size in (side, int(side * 1.2), int(side * 0.8), 300):
-        warped = _warp_quad(gray, big, size)
-        if warped is not None:
-            t = _try_rotations(warped)
+    # FIX: try multiple expansion margins — detector bbox tightness varies
+    for margin in (0.12, 0.20, 0.05, 0.30):
+        big = _expand_quad(ordered, margin)
+        for size in (side, int(side * 1.2), int(side * 0.8), 300):
+            t = _try_warp_with_enhancements(gray, big, size)
             if t:
                 return t
 
@@ -283,10 +360,10 @@ def _karrach_warp(gray, poly):
     for alt in range(4):
         if alt == p4:
             continue
-        alt_quad = _expand_quad(np.roll(quad, -((alt - 2) % 4), axis=0), 0.12)
-        warped = _warp_quad(gray, alt_quad, side)
-        if warped is not None:
-            t = _try_rotations(warped)
+        alt_ordered = np.roll(quad, -((alt - 2) % 4), axis=0)
+        alt_quad = _expand_quad(alt_ordered, 0.12)
+        for size in (side, int(side * 1.2), 300):
+            t = _try_warp_with_enhancements(gray, alt_quad, size)
             if t:
                 return t
 
@@ -306,14 +383,6 @@ def _hull_poly(gray):
 
 # ── decode helpers ────────────────────────────────────────────────────────────
 
-def _try_rotations(img):
-    for k in range(4):
-        t = _pyzbar(np.rot90(img, k) if k else img)
-        if t:
-            return t
-    return None
-
-
 def _quick_decode(img):
     t = _pyzbar(img)
     if t: return t
@@ -324,6 +393,12 @@ def _quick_decode(img):
     if t: return t
 
     t = _pyzbar(255 - gray)
+    if t: return t
+
+    # FIX: also try adaptive threshold in quick decode
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 11, 2)
+    t = _pyzbar(adaptive)
     if t: return t
 
     return None
@@ -366,6 +441,11 @@ def _enhanced_decode(img):
 
 def try_decode_crop(crop, timeout=2.0):
     deadline = time.monotonic() + timeout
+
+    # FIX: try a direct quick decode BEFORE padding/warping — if the crop
+    # is already well-framed, this saves all the warp overhead
+    t = _quick_decode(crop)
+    if t: return t
 
     padded = _pad(crop)
     gray_padded = _to_gray(padded)
