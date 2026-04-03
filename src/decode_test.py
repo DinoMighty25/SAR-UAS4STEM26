@@ -16,6 +16,9 @@ MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_out
 MODEL_INPUT_WIDTH = 512
 MODEL_INPUT_HEIGHT = 512
 
+# how long a decoded result stays on screen after detection disappears (seconds)
+RESULT_PERSIST_SEC = 1.0
+
 
 def initialize_imx500(model_path):
     print("loading model...")
@@ -52,7 +55,7 @@ def parse_detections(imx, picam2, metadata, img_width, img_height, conf_threshol
             num_detections = int(num_dets.item() if hasattr(num_dets, 'item') else num_dets.flatten()[0])
         else:
             num_detections = len(scores)
-    except:
+    except Exception:
         num_detections = len(scores)
 
     detections = []
@@ -99,18 +102,18 @@ def draw_detection(frame, detection, decoded_text=None):
 
 
 def decode_worker(decode_q, result_holder, result_lock):
+    """Background thread that decodes QR crops from the queue."""
     while True:
         try:
             crop = decode_q.get(timeout=1)
             if crop is None:
                 break
             text = try_decode_crop(crop)
-            if text is not None:
-                print(f"decoded: {text}")
-                with result_lock:
+            with result_lock:
+                if text is not None:
+                    print(f"decoded: {text}")
                     result_holder['text'] = text
-            else:
-                print("decode failed")
+                    result_holder['last_decode_time'] = time.monotonic()
         except queue.Empty:
             continue
         except Exception as e:
@@ -122,7 +125,7 @@ def main():
     picam2 = setup_camera(imx)
 
     decode_q = queue.Queue(maxsize=1)
-    result_holder = {'text': None}
+    result_holder = {'text': None, 'last_decode_time': 0.0}
     result_lock = threading.Lock()
     t = threading.Thread(target=decode_worker, args=(decode_q, result_holder, result_lock), daemon=True)
     t.start()
@@ -141,29 +144,44 @@ def main():
 
                 detections = parse_detections(imx, picam2, metadata, img_w, img_h, CONFIDENCE_THRESHOLD)
 
+                # FIX: read the persisted result once per frame
+                with result_lock:
+                    decoded_text = result_holder['text']
+                    last_time = result_holder['last_decode_time']
+
                 if detections:
-                    detection = detections[0]
                     detection_count += 1
 
-                    x1, y1, x2, y2 = detection['bbox']
-                    crop = safe_crop(frame, x1, y1, x2, y2)
-                    if crop is not None and crop.size > 0:
-                        try:
-                            decode_q.put_nowait(crop.copy())
-                        except queue.Full:
-                            pass
+                    # FIX: try ALL detections, not just the first one.
+                    # Submit the highest-confidence crop that isn't already queued.
+                    for detection in detections:
+                        x1, y1, x2, y2 = detection['bbox']
+                        crop = safe_crop(frame, x1, y1, x2, y2)
+                        if crop is not None and crop.size > 0:
+                            try:
+                                decode_q.put_nowait(crop.copy())
+                                break  # submitted one crop, move on
+                            except queue.Full:
+                                break  # worker is busy, don't block
 
-                    with result_lock:
-                        decoded_text = result_holder['text']
+                    # draw all detections
+                    for detection in detections:
+                        draw_detection(frame, detection, decoded_text)
 
-                    draw_detection(frame, detection, decoded_text)
                     cv2.putText(frame, f"detections: {detection_count}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
-                    with result_lock:
-                        result_holder['text'] = None
-                    cv2.putText(frame, "searching...",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if decoded_text and (time.monotonic() - last_time > RESULT_PERSIST_SEC):
+                        with result_lock:
+                            result_holder['text'] = None
+                        decoded_text = None
+
+                    if decoded_text:
+                        cv2.putText(frame, f"last qr: {decoded_text[:60]}",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(frame, "searching...",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 cv2.imshow('QR decode test', frame)
                 frame_count += 1
