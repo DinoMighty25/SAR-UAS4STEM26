@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-qr_decode.py — QR code perspective correction and decoding library.
 
-All geometry, warping, finder-pattern scoring, edge-projection refinement,
-and pyzbar decode logic lives here. Import into any camera frontend.
-
-Usage:
-    from qr_decode import decode_qr, try_decode
-"""
 
 import cv2
 import numpy as np
