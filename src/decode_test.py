@@ -1,19 +1,21 @@
-#!/usr/bin/env python3
 
 import cv2
 import math
 import numpy as np
 import time
+import threading
+import queue
 
 from picamera2 import Picamera2
 from picamera2.devices.imx500 import IMX500
 
-from qr_decode import decode_qr, bbox_to_polygon
+from qr_decode_with_warp import decode_qr, bbox_to_polygon
 
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
 MODEL_INPUT_WIDTH = 640
 MODEL_INPUT_HEIGHT = 640
 CONF_THRESHOLD = 0.15
+
 
 def initialize_imx500(model_path):
     print("loading model...")
@@ -36,9 +38,7 @@ def setup_camera(imx):
     return picam2
 
 
-
 def parse_detections(imx, picam2, metadata, img_width, img_height):
-    """Parse IMX500 output tensors into detection dicts with segmentation polygons."""
     outputs = imx.get_outputs(metadata, add_batch=False)
     if outputs is None or len(outputs) < 2:
         return []
@@ -46,7 +46,6 @@ def parse_detections(imx, picam2, metadata, img_width, img_height):
     bboxes = outputs[0]
     scores = outputs[1]
 
-    # Look for segmentation mask tensors
     mask_coeffs = None
     mask_protos = None
 
@@ -62,7 +61,6 @@ def parse_detections(imx, picam2, metadata, img_width, img_height):
 
     has_masks = mask_coeffs is not None and mask_protos is not None
 
-    # Number of detections
     try:
         num_detections = len(scores)
         for idx in range(2, len(outputs)):
@@ -112,7 +110,6 @@ def parse_detections(imx, picam2, metadata, img_width, img_height):
 
 
 def _extract_polygon(coefficients, protos, bbox, img_w, img_h):
-    """Combine mask coefficients with prototype masks to get a segmentation polygon."""
     try:
         proto_h, proto_w = protos.shape[1], protos.shape[2]
 
@@ -132,7 +129,8 @@ def _extract_polygon(coefficients, protos, bbox, img_w, img_h):
         cropped[py1:py2, px1:px2] = mask[py1:py2, px1:px2]
 
         binary = (cropped > 0.5).astype(np.uint8) * 255
-        binary = cv2.resize(binary, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+        binary = cv2.resize(binary, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+        _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
 
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -142,16 +140,49 @@ def _extract_polygon(coefficients, protos, bbox, img_w, img_h):
         if cv2.contourArea(cnt) < 100:
             return None
 
+        epsilon = 0.015 * cv2.arcLength(cnt, True)
+        cnt = cv2.approxPolyDP(cnt, epsilon, True)
+
         return cnt.reshape(-1, 2).astype(np.float32)
 
     except Exception:
         return None
 
 
+def decode_worker(decode_q, result_lock, result_holder):
+    while True:
+        try:
+            item = decode_q.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        if item is None:
+            break
+
+        frame, poly, bbox = item
+        try:
+            text = decode_qr(frame, poly, bbox)
+        except Exception as e:
+            print(f"decode error: {e}")
+            text = None
+
+        with result_lock:
+            result_holder['text'] = text
+            result_holder['bbox'] = bbox
+
 
 def main():
     imx = initialize_imx500(MODEL_PATH)
     picam2 = setup_camera(imx)
+
+    decode_q = queue.Queue(maxsize=1)
+    result_holder = {'text': None, 'bbox': None}
+    result_lock = threading.Lock()
+
+    t = threading.Thread(target=decode_worker,
+                         args=(decode_q, result_lock, result_holder),
+                         daemon=True)
+    t.start()
 
     print("QR Reader running. Press 'q' to quit.\n")
 
@@ -163,35 +194,44 @@ def main():
             img_h, img_w = frame.shape[:2]
 
             detections = parse_detections(imx, picam2, metadata, img_w, img_h)
-            texts = []
+
+            with result_lock:
+                decoded_text = result_holder['text']
 
             for i, det in enumerate(detections):
                 bbox = det['bbox']
                 conf = det['confidence']
                 poly = det['polygon'] if det['polygon'] is not None else bbox_to_polygon(bbox)
 
-                text = decode_qr(frame, poly, bbox)
+                try:
+                    decode_q.put_nowait((frame.copy(), poly.copy(), bbox))
+                except queue.Full:
+                    pass
 
-                # Draw segmentation polygon
                 if det['polygon'] is not None:
                     pts = det['polygon'].astype(int).reshape(-1, 1, 2)
                     cv2.polylines(frame, [pts], True, (255, 255, 0), 2)
 
                 x1, y1, x2, y2 = bbox
-                if text:
-                    texts.append(text)
-                    print(f"[QR {i}] {text}")
+                if decoded_text:
+                    print(f"[QR {i}] {decoded_text}")
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, text[:50], (x1, y1 - 10),
+                    cv2.putText(frame, decoded_text[:50], (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 else:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                     cv2.putText(frame, f"QR ({conf:.0%})", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
+            if not detections:
+                with result_lock:
+                    result_holder['text'] = None
+
             n = len(detections)
-            cv2.putText(frame, f"Detected: {n} | Decoded: {len(texts)}",
-                        (10, frame.shape[0] - 10),
+            status = f"Detected: {n}"
+            if decoded_text:
+                status += f" | Decoded: {decoded_text[:30]}"
+            cv2.putText(frame, status, (10, frame.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             cv2.imshow("QR Reader", frame)
@@ -202,6 +242,8 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+    decode_q.put(None)
+    t.join(timeout=2)
     picam2.stop()
     cv2.destroyAllWindows()
 
