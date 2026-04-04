@@ -1,3 +1,4 @@
+
 import cv2
 import math
 import numpy as np
@@ -8,7 +9,7 @@ import queue
 from picamera2 import Picamera2
 from picamera2.devices.imx500 import IMX500
 
-from qr_decode_with_warp import decode_qr, bbox_to_polygon
+from qr_decode_simple import decode_qr, bbox_to_polygon
 
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
 CONF_THRESHOLD = 0.3
@@ -50,23 +51,6 @@ def parse_detections(imx, picam2, metadata, img_w, img_h):
 
     boxes = outputs[0]
     scores = outputs[1]
-
-    mask_coeffs = None
-    mask_protos = None
-    if len(outputs) >= 5:
-        if outputs[3].ndim == 2 and outputs[3].shape[-1] == 32:
-            mask_coeffs = outputs[3]
-        if outputs[4].ndim == 3 and outputs[4].shape[0] == 32:
-            mask_protos = outputs[4]
-    elif len(outputs) >= 4:
-        for idx in range(2, len(outputs)):
-            t = outputs[idx]
-            if t.ndim == 2 and t.shape[-1] == 32:
-                mask_coeffs = t
-            elif t.ndim == 3 and t.shape[0] == 32:
-                mask_protos = t
-
-    has_masks = mask_coeffs is not None and mask_protos is not None
     input_w, input_h = imx.get_input_size()
 
     detections = []
@@ -87,68 +71,13 @@ def parse_detections(imx, picam2, metadata, img_w, img_h):
         if bx2 - bx1 < 10 or by2 - by1 < 10:
             continue
 
-        polygon = None
-        if has_masks and i < len(mask_coeffs):
-            polygon = _extract_polygon(
-                mask_coeffs[i], mask_protos,
-                (x0, y0, x1, y1),
-                (bx1, by1, bx2, by2),
-                input_w, input_h
-            )
-
         detections.append({
             'bbox': (bx1, by1, bx2, by2),
             'confidence': conf,
-            'polygon': polygon,
         })
 
     detections.sort(key=lambda d: d['confidence'], reverse=True)
     return detections
-
-
-def _extract_polygon(coefficients, protos, raw_bbox, img_bbox, input_w, input_h):
-    try:
-        c, proto_h, proto_w = protos.shape
-        raw = coefficients.astype(np.float32) @ protos.reshape(c, -1).astype(np.float32)
-        raw = raw.reshape(proto_h, proto_w)
-        mask = 1.0 / (1.0 + np.exp(-np.clip(raw, -20, 20)))
-
-        sx = proto_w / input_w
-        sy = proto_h / input_h
-        rx1, ry1, rx2, ry2 = raw_bbox
-        px1 = max(0, int(rx1 * sx))
-        py1 = max(0, int(ry1 * sy))
-        px2 = min(proto_w, int(rx2 * sx))
-        py2 = min(proto_h, int(ry2 * sy))
-
-        if px2 - px1 < 2 or py2 - py1 < 2:
-            return None
-
-        patch = mask[py1:py2, px1:px2]
-        P = 200
-        patch_big = cv2.resize(patch, (P, P), interpolation=cv2.INTER_LINEAR)
-        binary = (patch_big > 0.5).astype(np.uint8) * 255
-
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        cnt = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(cnt) < 50:
-            return None
-
-        epsilon = 0.012 * cv2.arcLength(cnt, True)
-        cnt = cv2.approxPolyDP(cnt, epsilon, True)
-        pts = cnt.reshape(-1, 2).astype(np.float32)
-
-        ix1, iy1, ix2, iy2 = img_bbox
-        out = np.zeros_like(pts)
-        out[:, 0] = ix1 + (pts[:, 0] / P) * (ix2 - ix1)
-        out[:, 1] = iy1 + (pts[:, 1] / P) * (iy2 - iy1)
-        return out
-
-    except Exception:
-        return None
 
 
 def decode_worker(decode_q, result_lock, result_holder):
@@ -206,16 +135,12 @@ def main():
             for i, det in enumerate(detections):
                 bbox = det['bbox']
                 conf = det['confidence']
-                poly = det['polygon'] if det['polygon'] is not None else bbox_to_polygon(bbox)
+                poly = bbox_to_polygon(bbox)
 
                 try:
                     decode_q.put_nowait((frame.copy(), poly.copy(), bbox))
                 except queue.Full:
                     pass
-
-                if det['polygon'] is not None:
-                    pts = det['polygon'].astype(int).reshape(-1, 1, 2)
-                    cv2.polylines(frame, [pts], True, (255, 255, 0), 2)
 
                 x1, y1, x2, y2 = bbox
                 if decoded_text:
