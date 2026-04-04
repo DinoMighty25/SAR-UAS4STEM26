@@ -12,9 +12,7 @@ from picamera2.devices.imx500 import IMX500
 from qr_decode_with_warp import decode_qr, bbox_to_polygon
 
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
-MODEL_INPUT_WIDTH = 640
-MODEL_INPUT_HEIGHT = 640
-CONF_THRESHOLD = 0.15
+CONF_THRESHOLD = 0.3
 
 
 def initialize_imx500(model_path):
@@ -38,69 +36,83 @@ def setup_camera(imx):
     return picam2
 
 
-def parse_detections(imx, picam2, metadata, img_width, img_height):
+def parse_detections(imx, picam2, metadata, img_w, img_h):
+    """
+    Parse the 5 post-NMS output tensors from YOLO11n-seg on IMX500.
+
+    Boxes are xyxy in model input pixel space.
+    convert_inference_coords expects normalized (y0, x0, y1, x1) — note YX order.
+    It returns (x, y, w, h) in the output image space.
+    """
     outputs = imx.get_outputs(metadata, add_batch=False)
-    if outputs is None or len(outputs) < 2:
+    if outputs is None:
         return []
 
-    bboxes = outputs[0]
+    # debug: print shapes on first call
+    if not hasattr(parse_detections, '_printed'):
+        parse_detections._printed = True
+        for i, o in enumerate(outputs):
+            print(f"  output[{i}]: shape={o.shape} dtype={o.dtype}")
+
+    if len(outputs) < 2:
+        return []
+
+    boxes = outputs[0]
     scores = outputs[1]
 
+    # seg tensors: mask coefficients and protos
     mask_coeffs = None
     mask_protos = None
-
-    if len(outputs) >= 4:
+    if len(outputs) >= 5:
+        # standard YOLO11-seg layout: boxes, scores, labels, coeffs, protos
+        if outputs[3].ndim == 2 and outputs[3].shape[-1] == 32:
+            mask_coeffs = outputs[3]
+        if outputs[4].ndim == 3 and outputs[4].shape[0] == 32:
+            mask_protos = outputs[4]
+    elif len(outputs) >= 4:
+        # fallback: search by shape
         for idx in range(2, len(outputs)):
-            tensor = outputs[idx]
-            if tensor.ndim == 2 and tensor.shape[1] == 32:
-                mask_coeffs = tensor
-            elif tensor.ndim == 3 and tensor.shape[0] == 32:
-                mask_protos = tensor
-            elif tensor.ndim == 4 and tensor.shape[1] == 32:
-                mask_protos = tensor[0]
+            t = outputs[idx]
+            if t.ndim == 2 and t.shape[-1] == 32:
+                mask_coeffs = t
+            elif t.ndim == 3 and t.shape[0] == 32:
+                mask_protos = t
 
     has_masks = mask_coeffs is not None and mask_protos is not None
 
-    try:
-        num_detections = len(scores)
-        for idx in range(2, len(outputs)):
-            t = outputs[idx]
-            if t.ndim <= 1 or (t.ndim == 1 and t.shape[0] == 1):
-                num_detections = int(t.item() if hasattr(t, 'item') else t.flatten()[0])
-                break
-    except:
-        num_detections = len(scores)
+    input_w, input_h = imx.get_input_size()
 
     detections = []
-    for i in range(min(num_detections, len(bboxes))):
+    for i in range(len(scores)):
         conf = float(scores[i])
         if conf < CONF_THRESHOLD:
             continue
 
-        raw_x1, raw_y1, raw_x2, raw_y2 = [float(v) for v in bboxes[i]]
-        rel_x1 = raw_x1 / MODEL_INPUT_WIDTH
-        rel_y1 = raw_y1 / MODEL_INPUT_HEIGHT
-        rel_x2 = raw_x2 / MODEL_INPUT_WIDTH
-        rel_y2 = raw_y2 / MODEL_INPUT_HEIGHT
+        x0, y0, x1, y1 = [float(v) for v in boxes[i]]
 
-        x, y, w, h = imx.convert_inference_coords(
-            (rel_y1, rel_x1, rel_y2, rel_x2), metadata, picam2
-        )
+        # normalize and swap to (y0, x0, y1, x1) for convert_inference_coords
+        coords = (y0 / input_h, x0 / input_w, y1 / input_h, x1 / input_w)
+        ix, iy, iw, ih = imx.convert_inference_coords(coords, metadata, picam2)
 
-        x1 = max(0, min(x, img_width))
-        y1 = max(0, min(y, img_height))
-        x2 = max(0, min(x + w, img_width))
-        y2 = max(0, min(y + h, img_height))
+        bx1 = max(0, min(int(ix), img_w))
+        by1 = max(0, min(int(iy), img_h))
+        bx2 = max(0, min(int(ix + iw), img_w))
+        by2 = max(0, min(int(iy + ih), img_h))
+
+        if bx2 - bx1 < 10 or by2 - by1 < 10:
+            continue
 
         polygon = None
         if has_masks and i < len(mask_coeffs):
             polygon = _extract_polygon(
                 mask_coeffs[i], mask_protos,
-                imx, picam2, metadata, img_width, img_height
+                (x0, y0, x1, y1),
+                (bx1, by1, bx2, by2),
+                input_w, input_h
             )
 
         detections.append({
-            'bbox': (math.floor(x1), math.floor(y1), math.ceil(x2), math.ceil(y2)),
+            'bbox': (bx1, by1, bx2, by2),
             'confidence': conf,
             'polygon': polygon,
         })
@@ -109,52 +121,59 @@ def parse_detections(imx, picam2, metadata, img_width, img_height):
     return detections
 
 
-def _extract_polygon(coefficients, protos, imx, picam2, metadata, img_w, img_h):
+def _extract_polygon(coefficients, protos, raw_bbox, img_bbox, input_w, input_h):
+    """
+    Reconstruct segmentation mask from coefficients × protos.
+    raw_bbox: xyxy in model input space (0-640)
+    img_bbox: xyxy in output image space (already converted)
+
+    mask = sigmoid(coefficients @ protos), cropped to raw_bbox,
+    contour extracted in patch space, mapped to img_bbox.
+    """
     try:
-        proto_h, proto_w = protos.shape[1], protos.shape[2]
+        c, proto_h, proto_w = protos.shape
 
-        mask = coefficients @ protos.reshape(32, -1)
-        mask = mask.reshape(proto_h, proto_w)
-        mask = 1.0 / (1.0 + np.exp(-mask))
+        raw = coefficients.astype(np.float32) @ protos.reshape(c, -1).astype(np.float32)
+        raw = raw.reshape(proto_h, proto_w)
+        mask = 1.0 / (1.0 + np.exp(-np.clip(raw, -20, 20)))
 
-        binary = (mask > 0.5).astype(np.uint8) * 255
+        # crop to raw bbox in proto space
+        sx = proto_w / input_w
+        sy = proto_h / input_h
+        rx1, ry1, rx2, ry2 = raw_bbox
+        px1 = max(0, int(rx1 * sx))
+        py1 = max(0, int(ry1 * sy))
+        px2 = min(proto_w, int(rx2 * sx))
+        py2 = min(proto_h, int(ry2 * sy))
 
-        # resize to model input size first, then we'll map contour points
-        binary = cv2.resize(binary, (MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT),
-                            interpolation=cv2.INTER_LINEAR)
-        _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
+        if px2 - px1 < 2 or py2 - py1 < 2:
+            return None
+
+        patch = mask[py1:py2, px1:px2]
+
+        # resize patch to fixed size for contour extraction
+        P = 200
+        patch_big = cv2.resize(patch, (P, P), interpolation=cv2.INTER_LINEAR)
+        binary = (patch_big > 0.5).astype(np.uint8) * 255
 
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
 
         cnt = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(cnt) < 100:
+        if cv2.contourArea(cnt) < 50:
             return None
 
-        epsilon = 0.015 * cv2.arcLength(cnt, True)
+        epsilon = 0.012 * cv2.arcLength(cnt, True)
         cnt = cv2.approxPolyDP(cnt, epsilon, True)
         pts = cnt.reshape(-1, 2).astype(np.float32)
 
-        # convert each contour point from model coords to image coords
-        # using the same function that correctly maps bboxes
-        converted = []
-        for pt in pts:
-            px, py = float(pt[0]), float(pt[1])
-            rel_x = px / MODEL_INPUT_WIDTH
-            rel_y = py / MODEL_INPUT_HEIGHT
-            # convert_inference_coords expects (y1, x1, y2, x2) relative,
-            # returns (x, y, w, h). use a tiny box around the point.
-            eps = 0.001
-            x, y, w, h = imx.convert_inference_coords(
-                (rel_y - eps, rel_x - eps, rel_y + eps, rel_x + eps),
-                metadata, picam2
-            )
-            img_x = np.clip(x + w / 2, 0, img_w - 1)
-            img_y = np.clip(y + h / 2, 0, img_h - 1)
-            converted.append([img_x, img_y])
-
-        return np.float32(converted)
+        # map from patch coords (0..P) to image bbox
+        ix1, iy1, ix2, iy2 = img_bbox
+        out = np.zeros_like(pts)
+        out[:, 0] = ix1 + (pts[:, 0] / P) * (ix2 - ix1)
+        out[:, 1] = iy1 + (pts[:, 1] / P) * (iy2 - iy1)
+        return out
 
     except Exception:
         return None
@@ -166,7 +185,6 @@ def decode_worker(decode_q, result_lock, result_holder):
             item = decode_q.get(timeout=1)
         except queue.Empty:
             continue
-
         if item is None:
             break
 
@@ -179,7 +197,6 @@ def decode_worker(decode_q, result_lock, result_holder):
 
         with result_lock:
             result_holder['text'] = text
-            result_holder['bbox'] = bbox
 
 
 def main():
@@ -187,7 +204,7 @@ def main():
     picam2 = setup_camera(imx)
 
     decode_q = queue.Queue(maxsize=1)
-    result_holder = {'text': None, 'bbox': None}
+    result_holder = {'text': None}
     result_lock = threading.Lock()
 
     t = threading.Thread(target=decode_worker,
@@ -214,18 +231,19 @@ def main():
                 conf = det['confidence']
                 poly = det['polygon'] if det['polygon'] is not None else bbox_to_polygon(bbox)
 
+                # submit to background decode (drop if busy)
                 try:
                     decode_q.put_nowait((frame.copy(), poly.copy(), bbox))
                 except queue.Full:
                     pass
 
+                # draw segmentation polygon
                 if det['polygon'] is not None:
                     pts = det['polygon'].astype(int).reshape(-1, 1, 2)
                     cv2.polylines(frame, [pts], True, (255, 255, 0), 2)
 
                 x1, y1, x2, y2 = bbox
                 if decoded_text:
-                    print(f"[QR {i}] {decoded_text}")
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(frame, decoded_text[:50], (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
@@ -241,7 +259,7 @@ def main():
             n = len(detections)
             status = f"Detected: {n}"
             if decoded_text:
-                status += f" | Decoded: {decoded_text[:30]}"
+                status += f" | {decoded_text[:30]}"
             cv2.putText(frame, status, (10, frame.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
