@@ -1,13 +1,10 @@
-#!/usr/bin/env python3
-
-
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
 
 
+
 def order_quad(pts):
-    """Sort 4 points into TL / TR / BR / BL."""
     sums = pts.sum(1)
     diffs = np.diff(pts, axis=1).ravel()
     return np.float32([pts[sums.argmin()], pts[diffs.argmin()],
@@ -15,9 +12,6 @@ def order_quad(pts):
 
 
 def polygon_corners(poly):
-    """Pick the 4 tightest corners off a polygon.
-    Rotates into the minAreaRect frame so we grab actual boundary
-    points, not convex-hull overshoots."""
     pts = poly.astype(np.float32)
     if len(pts) < 4:
         return None
@@ -44,20 +38,17 @@ def polygon_corners(poly):
 
 
 def expand_quad(quad, margin=0.12):
-    """Push each corner outward from centroid."""
     center = quad.mean(0)
     return np.float32(center + (quad - center) * (1 + margin))
 
 
 def bbox_to_polygon(bbox):
-    """Convert bbox (x1,y1,x2,y2) to rectangle polygon."""
     x1, y1, x2, y2 = bbox
     return np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
 
 
 
 def fp_score(gray, center, radius):
-    """Score how likely a region around `center` contains a finder pattern."""
     h, w = gray.shape
     cx, cy = int(center[0]), int(center[1])
     r = int(radius)
@@ -68,7 +59,6 @@ def fp_score(gray, center, radius):
 
     patch = gray[y0:y1, x0:x1]
     best = 0.0
-
     for block_sz, thresh_c in [(31, 10), (51, 5), (21, 15)]:
         block_sz = min(block_sz, max(3, min(patch.shape) // 2 * 2 - 1))
         binary = cv2.adaptiveThreshold(
@@ -82,12 +72,10 @@ def fp_score(gray, center, radius):
 
 
 def _scanline_score(binary):
-    """Scan middle rows for 1:1:3:1:1 ratio."""
     ph, pw = binary.shape
     for y in range(ph // 3, 2 * ph // 3, 2):
         row = binary[y]
-        runs = []
-        val, length = row[0], 1
+        runs, val, length = [], row[0], 1
         for x in range(1, pw):
             if row[x] == val:
                 length += 1
@@ -116,7 +104,6 @@ def _scanline_score(binary):
 
 
 def _nesting_score(binary):
-    """Check for contour nesting depth >= 2."""
     contours, hier = cv2.findContours(
         binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if hier is None:
@@ -137,7 +124,6 @@ def _nesting_score(binary):
 
 
 def pick_p4(gray, quad):
-    """Return the index of the corner without a finder pattern."""
     side = (np.linalg.norm(quad[0] - quad[1])
             + np.linalg.norm(quad[1] - quad[2])) / 2
     scores = [fp_score(gray, corner, side * 0.3) for corner in quad]
@@ -149,7 +135,6 @@ def pick_p4(gray, quad):
 
 
 def warp_quad(img, quad, size):
-    """Perspective-warp a quadrilateral to a square."""
     dst = np.float32([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]])
     try:
         M = cv2.getPerspectiveTransform(np.float32(quad), dst)
@@ -159,7 +144,6 @@ def warp_quad(img, quad, size):
 
 
 def edge_proj_score(gray, quad):
-    """Std-dev of H & V edge projections. Higher = better quad boundary."""
     h, w = gray.shape[:2]
     pts = np.clip(np.float32(quad), [0, 0], [w - 1, h - 1])
     N = 100
@@ -176,7 +160,6 @@ def edge_proj_score(gray, quad):
 
 
 def refine_p4(gray, quad, p4_idx):
-    """Walk P4 to maximise edge_proj_score."""
     best = quad.copy()
     best_score = edge_proj_score(gray, best)
 
@@ -209,13 +192,11 @@ def refine_p4(gray, quad, p4_idx):
                         cur_dir = -cur_dir
                         break
             cur_step /= 2
-
     return best
 
 
 
 def rotate_crop(gray, poly):
-    """De-rotate by the QR's tilt angle, then crop with padding."""
     rect = cv2.minAreaRect(poly.astype(np.float32))
     center, (rw, rh), angle = rect
     if rw < rh:
@@ -252,7 +233,6 @@ def to_gray(img):
 
 
 def safe_crop(img, x1, y1, x2, y2, pad=0):
-    """Crop with bounds checking and optional padding."""
     h, w = img.shape[:2]
     x1 = max(0, int(x1) - pad)
     y1 = max(0, int(y1) - pad)
@@ -264,7 +244,6 @@ def safe_crop(img, x1, y1, x2, y2, pad=0):
 
 
 def try_decode(img):
-    """Run pyzbar with multiple binarization strategies."""
     if img is None or img.size == 0:
         return None
     gray = to_gray(img)
@@ -290,7 +269,6 @@ def try_decode(img):
 
 
 def try_all_rotations(img):
-    """try_decode at 0/90/180/270."""
     if img is None or img.size == 0:
         return None
     for k in range(4):
@@ -301,23 +279,13 @@ def try_all_rotations(img):
     return None
 
 
+
 def decode_qr(frame, poly_xy, bbox):
     """
-    Full QR decode pipeline.
-    
-    1. De-rotate and crop
-    2. Perspective warp via polygon corners + finder-pattern P4 detection
-    3. Edge-projection refinement of P4
-    4. Try alternate P4 corners
-    5. Raw bbox crop as last resort
-    
-    Args:
-        frame: BGR or grayscale image
-        poly_xy: (N, 2) polygon points (segmentation or bbox rectangle)
-        bbox: (x1, y1, x2, y2) bounding box tuple
-        
-    Returns:
-        Decoded text string or None
+    frame:   BGR or grayscale image
+    poly_xy: (N, 2) polygon from segmentation, or rectangle from bbox_to_polygon
+    bbox:    (x1, y1, x2, y2)
+    returns: decoded text or None
     """
     poly = np.float32(poly_xy)
     side = int(max(cv2.minAreaRect(poly)[1]))
@@ -332,7 +300,7 @@ def decode_qr(frame, poly_xy, bbox):
         if text:
             return text
 
-    # 2) perspective warp via polygon corners
+    # 2) perspective warp with finder-pattern P4 detection
     quad = polygon_corners(poly)
     if quad is None:
         return None
@@ -366,7 +334,7 @@ def decode_qr(frame, poly_xy, bbox):
     if result:
         return result
 
-    # 4) last resort: raw bbox crop
+    # 4) bbox crop fallback
     x0, y0, x1, y1 = bbox
     pad = max(10, side // 8)
     crop = safe_crop(gray, x0, y0, x1, y1, pad=pad)
