@@ -1,4 +1,3 @@
-
 import cv2
 import math
 import numpy as np
@@ -37,18 +36,10 @@ def setup_camera(imx):
 
 
 def parse_detections(imx, picam2, metadata, img_w, img_h):
-    """
-    Parse the 5 post-NMS output tensors from YOLO11n-seg on IMX500.
-
-    Boxes are xyxy in model input pixel space.
-    convert_inference_coords expects normalized (y0, x0, y1, x1) — note YX order.
-    It returns (x, y, w, h) in the output image space.
-    """
     outputs = imx.get_outputs(metadata, add_batch=False)
     if outputs is None:
         return []
 
-    # debug: print shapes on first call
     if not hasattr(parse_detections, '_printed'):
         parse_detections._printed = True
         for i, o in enumerate(outputs):
@@ -60,17 +51,14 @@ def parse_detections(imx, picam2, metadata, img_w, img_h):
     boxes = outputs[0]
     scores = outputs[1]
 
-    # seg tensors: mask coefficients and protos
     mask_coeffs = None
     mask_protos = None
     if len(outputs) >= 5:
-        # standard YOLO11-seg layout: boxes, scores, labels, coeffs, protos
         if outputs[3].ndim == 2 and outputs[3].shape[-1] == 32:
             mask_coeffs = outputs[3]
         if outputs[4].ndim == 3 and outputs[4].shape[0] == 32:
             mask_protos = outputs[4]
     elif len(outputs) >= 4:
-        # fallback: search by shape
         for idx in range(2, len(outputs)):
             t = outputs[idx]
             if t.ndim == 2 and t.shape[-1] == 32:
@@ -79,7 +67,6 @@ def parse_detections(imx, picam2, metadata, img_w, img_h):
                 mask_protos = t
 
     has_masks = mask_coeffs is not None and mask_protos is not None
-
     input_w, input_h = imx.get_input_size()
 
     detections = []
@@ -89,8 +76,6 @@ def parse_detections(imx, picam2, metadata, img_w, img_h):
             continue
 
         x0, y0, x1, y1 = [float(v) for v in boxes[i]]
-
-        # normalize and swap to (y0, x0, y1, x1) for convert_inference_coords
         coords = (y0 / input_h, x0 / input_w, y1 / input_h, x1 / input_w)
         ix, iy, iw, ih = imx.convert_inference_coords(coords, metadata, picam2)
 
@@ -122,22 +107,12 @@ def parse_detections(imx, picam2, metadata, img_w, img_h):
 
 
 def _extract_polygon(coefficients, protos, raw_bbox, img_bbox, input_w, input_h):
-    """
-    Reconstruct segmentation mask from coefficients × protos.
-    raw_bbox: xyxy in model input space (0-640)
-    img_bbox: xyxy in output image space (already converted)
-
-    mask = sigmoid(coefficients @ protos), cropped to raw_bbox,
-    contour extracted in patch space, mapped to img_bbox.
-    """
     try:
         c, proto_h, proto_w = protos.shape
-
         raw = coefficients.astype(np.float32) @ protos.reshape(c, -1).astype(np.float32)
         raw = raw.reshape(proto_h, proto_w)
         mask = 1.0 / (1.0 + np.exp(-np.clip(raw, -20, 20)))
 
-        # crop to raw bbox in proto space
         sx = proto_w / input_w
         sy = proto_h / input_h
         rx1, ry1, rx2, ry2 = raw_bbox
@@ -150,8 +125,6 @@ def _extract_polygon(coefficients, protos, raw_bbox, img_bbox, input_w, input_h)
             return None
 
         patch = mask[py1:py2, px1:px2]
-
-        # resize patch to fixed size for contour extraction
         P = 200
         patch_big = cv2.resize(patch, (P, P), interpolation=cv2.INTER_LINEAR)
         binary = (patch_big > 0.5).astype(np.uint8) * 255
@@ -168,7 +141,6 @@ def _extract_polygon(coefficients, protos, raw_bbox, img_bbox, input_w, input_h)
         cnt = cv2.approxPolyDP(cnt, epsilon, True)
         pts = cnt.reshape(-1, 2).astype(np.float32)
 
-        # map from patch coords (0..P) to image bbox
         ix1, iy1, ix2, iy2 = img_bbox
         out = np.zeros_like(pts)
         out[:, 0] = ix1 + (pts[:, 0] / P) * (ix2 - ix1)
@@ -206,6 +178,7 @@ def main():
     decode_q = queue.Queue(maxsize=1)
     result_holder = {'text': None}
     result_lock = threading.Lock()
+    last_printed = None
 
     t = threading.Thread(target=decode_worker,
                          args=(decode_q, result_lock, result_holder),
@@ -226,18 +199,20 @@ def main():
             with result_lock:
                 decoded_text = result_holder['text']
 
+            if decoded_text and decoded_text != last_printed:
+                print(f"\n>>> {decoded_text}\n")
+                last_printed = decoded_text
+
             for i, det in enumerate(detections):
                 bbox = det['bbox']
                 conf = det['confidence']
                 poly = det['polygon'] if det['polygon'] is not None else bbox_to_polygon(bbox)
 
-                # submit to background decode (drop if busy)
                 try:
                     decode_q.put_nowait((frame.copy(), poly.copy(), bbox))
                 except queue.Full:
                     pass
 
-                # draw segmentation polygon
                 if det['polygon'] is not None:
                     pts = det['polygon'].astype(int).reshape(-1, 1, 2)
                     cv2.polylines(frame, [pts], True, (255, 255, 0), 2)
@@ -245,7 +220,7 @@ def main():
                 x1, y1, x2, y2 = bbox
                 if decoded_text:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, decoded_text[:50], (x1, y1 - 10),
+                    cv2.putText(frame, decoded_text[:60], (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 else:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -255,11 +230,12 @@ def main():
             if not detections:
                 with result_lock:
                     result_holder['text'] = None
+                    last_printed = None
 
             n = len(detections)
             status = f"Detected: {n}"
             if decoded_text:
-                status += f" | {decoded_text[:30]}"
+                status += f" | {decoded_text[:40]}"
             cv2.putText(frame, status, (10, frame.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
