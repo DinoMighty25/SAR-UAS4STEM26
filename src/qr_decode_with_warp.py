@@ -222,23 +222,48 @@ def try_decode(img):
         return None
     gray = to_gray(img)
 
-    candidates = [
-        img,
-        cv2.threshold(gray, 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        cv2.threshold(cv2.GaussianBlur(gray, (5, 5), 0), 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-    ]
+    # raw
+    hits = pyzbar_decode(img, symbols=[ZBarSymbol.QRCODE])
+    if hits:
+        return hits[0].data.decode("utf-8")
+
+    # otsu
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    hits = pyzbar_decode(otsu, symbols=[ZBarSymbol.QRCODE])
+    if hits:
+        return hits[0].data.decode("utf-8")
+
+    # blur + otsu
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, blur_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    hits = pyzbar_decode(blur_otsu, symbols=[ZBarSymbol.QRCODE])
+    if hits:
+        return hits[0].data.decode("utf-8")
+
+    # adaptive threshold
     if gray.shape[0] > 30:
         block = min(51, max(3, (min(gray.shape[:2]) // 4) | 1))
-        candidates.append(cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, block, 10))
-
-    for processed in candidates:
-        hits = pyzbar_decode(processed, symbols=[ZBarSymbol.QRCODE])
+        adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, block, 10)
+        hits = pyzbar_decode(adapt, symbols=[ZBarSymbol.QRCODE])
         if hits:
             return hits[0].data.decode("utf-8")
+
+    # CLAHE + otsu (handles uneven drone lighting)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+    _, clahe_otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    hits = pyzbar_decode(clahe_otsu, symbols=[ZBarSymbol.QRCODE])
+    if hits:
+        return hits[0].data.decode("utf-8")
+
+    # sharpen + otsu (helps with motion blur at altitude)
+    kernel = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]], dtype=np.float32)
+    sharp = cv2.filter2D(gray, -1, kernel)
+    _, sharp_otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    hits = pyzbar_decode(sharp_otsu, symbols=[ZBarSymbol.QRCODE])
+    if hits:
+        return hits[0].data.decode("utf-8")
+
     return None
 
 
