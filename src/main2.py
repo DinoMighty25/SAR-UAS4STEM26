@@ -12,10 +12,7 @@ import math
 import numpy as np
 
 from qr_decode_with_warp import decode_qr, bbox_to_polygon, send_qr
-from precision_land import (
-    connect_pixhawk, send_heartbeat, calculate_landing_target,
-    send_landing_target, MESSAGE_RATE_HZ, PIXHAWK_PORT
-)
+from precision_land import *
 
 CONFIDENCE_THRESHOLD = 0.3
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
