@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
+from pymavlink import mavutil
 
 
 def to_gray(img):
@@ -322,3 +323,29 @@ def decode_qr(frame, poly_xy, bbox):
             return text
 
     return None
+
+
+def send_qr(url, master):
+    msg = url.upper()
+    if "BENT-METAL-BALLPEEN" in msg:
+        msg = "BENT-METAL-BALLPEEN"
+    elif "BENT-NAIL-CLAW" in msg:
+        msg = "BENT-NAIL-CLAW"
+    elif "TOWER" in msg:
+        msg = "TOWER"
+    elif "MOVING-TARGET" in msg:
+        msg = "MOVING-TARGET"
+    elif "dHrQl" in msg:
+        msg = "STATIONARY-TARGET"
+    elif "BALLPEEN" in msg:
+        msg = "BALLPEEN-HAMMER"
+    elif "CLAW" in msg:
+        msg = "CLAW-HAMMER"
+    else:
+        msg = qr_data
+
+    master.mav.statustext_send(
+        mavutil.mavlink.MAV_SEVERITY_WARNING,
+        f"QR: {msg}".encode('utf-8')
+    )
+        
