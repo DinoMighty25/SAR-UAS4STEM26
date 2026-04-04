@@ -1,10 +1,4 @@
-"""
-qr_decode_with_warp.py
-
-Rotate-crop + bbox fallback QR decode. No camera dependencies.
-
-    from qr_decode_with_warp import decode_qr, bbox_to_polygon, send_qr
-"""
+# 
 
 import cv2
 import numpy as np
