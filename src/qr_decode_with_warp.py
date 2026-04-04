@@ -3,43 +3,21 @@ import numpy as np
 from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
 
 
-
-def order_quad(pts):
-    sums = pts.sum(1)
-    diffs = np.diff(pts, axis=1).ravel()
-    return np.float32([pts[sums.argmin()], pts[diffs.argmin()],
-                       pts[sums.argmax()], pts[diffs.argmax()]])
+def to_gray(img):
+    if img.ndim == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return img
 
 
-def polygon_corners(poly):
-    pts = poly.astype(np.float32)
-    if len(pts) < 4:
+def safe_crop(img, x1, y1, x2, y2, pad=0):
+    h, w = img.shape[:2]
+    x1 = max(0, int(x1) - pad)
+    y1 = max(0, int(y1) - pad)
+    x2 = min(w, int(x2) + pad)
+    y2 = min(h, int(y2) + pad)
+    if x2 <= x1 or y2 <= y1:
         return None
-
-    rect = cv2.minAreaRect(pts)
-    ang = rect[2] * np.pi / 180
-    cos, sin = np.cos(ang), np.sin(ang)
-    rot = np.column_stack([pts[:, 0]*cos + pts[:, 1]*sin,
-                           -pts[:, 0]*sin + pts[:, 1]*cos])
-
-    idx = [np.argmin(rot[:, 0] + rot[:, 1]),
-           np.argmax(rot[:, 0] - rot[:, 1]),
-           np.argmax(rot[:, 0] + rot[:, 1]),
-           np.argmin(rot[:, 0] - rot[:, 1])]
-
-    corners = np.float32([pts[i] for i in idx])
-
-    for i in range(4):
-        for j in range(i + 1, 4):
-            if np.linalg.norm(corners[i] - corners[j]) < 5:
-                return order_quad(cv2.boxPoints(rect).astype(np.float32))
-
-    return order_quad(corners)
-
-
-def expand_quad(quad, margin=0.12):
-    center = quad.mean(0)
-    return np.float32(center + (quad - center) * (1 + margin))
+    return img[y1:y2, x1:x2]
 
 
 def bbox_to_polygon(bbox):
@@ -47,111 +25,123 @@ def bbox_to_polygon(bbox):
     return np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
 
 
+def find_finder_patterns(gray, polygon):
+    """
+    Locate 3 finder pattern centers using contour hierarchy.
+    Finder patterns have nested structure: outer > white > inner (2+ nesting).
+    Returns (fp_tl, fp_tr, fp_bl) where fp_tl is the right-angle corner,
+    or None if detection fails.
+    """
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
+    masked = cv2.bitwise_and(gray, gray, mask=mask)
 
-def fp_score(gray, center, radius):
-    h, w = gray.shape
-    cx, cy = int(center[0]), int(center[1])
-    r = int(radius)
-    x0, y0 = max(cx - r, 0), max(cy - r, 0)
-    x1, y1 = min(cx + r, w), min(cy + r, h)
-    if x1 - x0 < 10 or y1 - y0 < 10:
-        return 0.0
+    block = min(51, max(3, (min(gray.shape[:2]) // 4) | 1))
+    binary = cv2.adaptiveThreshold(
+        masked, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, block, 10)
+    if np.mean(binary[mask > 0]) > 127:
+        binary = cv2.bitwise_not(binary)
+    binary = cv2.bitwise_and(binary, binary, mask=mask)
 
-    patch = gray[y0:y1, x0:x1]
-    best = 0.0
-    for block_sz, thresh_c in [(31, 10), (51, 5), (21, 15)]:
-        block_sz = min(block_sz, max(3, min(patch.shape) // 2 * 2 - 1))
-        binary = cv2.adaptiveThreshold(
-            patch, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, block_sz, thresh_c)
-        best = max(best, _scanline_score(binary))
-        best = max(best, _nesting_score(binary))
-        if best > 0.5:
-            break
-    return best
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None or len(contours) < 3:
+        return None
+    hierarchy = hierarchy[0]
 
-
-def _scanline_score(binary):
-    ph, pw = binary.shape
-    for y in range(ph // 3, 2 * ph // 3, 2):
-        row = binary[y]
-        runs, val, length = [], row[0], 1
-        for x in range(1, pw):
-            if row[x] == val:
-                length += 1
-            else:
-                runs.append((length, val))
-                val, length = row[x], 1
-        runs.append((length, val))
-
-        for j in range(len(runs) - 4):
-            segs = runs[j:j + 5]
-            if any(segs[k][1] == segs[k + 1][1] for k in range(4)):
-                continue
-            b1, w2, b3, w4, b5 = [s[0] for s in segs]
-            total = b1 + w2 + b3 + w4 + b5
-            if total < 7:
-                continue
-            u = total / 7.0
-            if not (0.5*u < b1 < 2*u and 0.5*u < w2 < 2*u
-                    and 1.5*u < b3 < 5*u
-                    and 0.5*u < w4 < 2*u and 0.5*u < b5 < 2*u):
-                continue
-            if b3 <= max(b1 + w2, w4 + b5):
-                continue
-            return 1.0
-    return 0.0
-
-
-def _nesting_score(binary):
-    contours, hier = cv2.findContours(
-        binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    if hier is None:
-        return 0.0
-    hier = hier[0]
-    best = 0.0
-    for i in range(len(contours)):
-        depth, child = 0, hier[i][2]
-        while child != -1:
-            depth += 1
-            child = hier[child][2]
-        if depth < 2 or cv2.contourArea(contours[i]) < 30:
+    candidates = []
+    for i, (cnt, hier) in enumerate(zip(contours, hierarchy)):
+        child = hier[2]
+        if child == -1:
             continue
-        rw, rh = cv2.minAreaRect(contours[i])[1]
-        if rw > 0 and rh > 0 and max(rw, rh) / min(rw, rh) < 2.0:
-            best = max(best, min(depth, 3) * 0.4)
-    return best
+        if hierarchy[child][2] == -1:
+            continue
 
+        area = cv2.contourArea(cnt)
+        if area < 50:
+            continue
 
-def pick_p4(gray, quad):
-    side = (np.linalg.norm(quad[0] - quad[1])
-            + np.linalg.norm(quad[1] - quad[2])) / 2
-    scores = [fp_score(gray, corner, side * 0.3) for corner in quad]
-    p4 = int(np.argmin(scores))
-    if sum(scores[i] > 0.3 for i in range(4) if i != p4) < 2:
-        p4 = 2
-    return p4
+        r = cv2.minAreaRect(cnt)
+        rw, rh = r[1]
+        if rw == 0 or rh == 0:
+            continue
+        if max(rw, rh) / min(rw, rh) > 1.5:
+            continue
 
+        child_area = cv2.contourArea(contours[child])
+        if child_area == 0 or area / child_area > 6:
+            continue
 
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        candidates.append((M["m10"]/M["m00"], M["m01"]/M["m00"], area))
 
-def warp_quad(img, quad, size):
-    dst = np.float32([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]])
-    try:
-        M = cv2.getPerspectiveTransform(np.float32(quad), dst)
-        return cv2.warpPerspective(img, M, (size, size))
-    except cv2.error:
+    if len(candidates) < 3:
         return None
 
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    centers = np.array([[c[0], c[1]] for c in candidates[:3]], dtype=np.float32)
 
-def edge_proj_score(gray, quad):
+    d01 = np.linalg.norm(centers[0] - centers[1])
+    d02 = np.linalg.norm(centers[0] - centers[2])
+    d12 = np.linalg.norm(centers[1] - centers[2])
+    sums = [d01 + d02, d01 + d12, d02 + d12]
+    tl_idx = int(np.argmin(sums))
+    other = [i for i in range(3) if i != tl_idx]
+
+    tl = centers[tl_idx]
+    v1 = centers[other[0]] - tl
+    v2 = centers[other[1]] - tl
+    cross = v1[0] * v2[1] - v1[1] * v2[0]
+
+    if cross > 0:
+        tr, bl = centers[other[0]], centers[other[1]]
+    else:
+        tr, bl = centers[other[1]], centers[other[0]]
+
+    return tl, tr, bl
+
+
+def estimate_corners(fp_tl, fp_tr, fp_bl):
+    """
+    Extend finder pattern centers to outer QR corners (Karrach eq. 6).
+    P4 = P1 + P3 - P2 (parallelogram rule).
+    """
+    d_tr = np.linalg.norm(fp_tr - fp_tl)
+    d_bl = np.linalg.norm(fp_bl - fp_tl)
+    mw = (d_tr + d_bl) / 2 / 14
+    if mw < 1:
+        mw = max(d_tr, d_bl) / 20
+    ext = mw * np.sqrt(18)
+
+    dir_tl_tr = (fp_tr - fp_tl) / (d_tr + 1e-8)
+    dir_tl_bl = (fp_bl - fp_tl) / (d_bl + 1e-8)
+
+    p2 = fp_tl - (dir_tl_tr + dir_tl_bl) * ext / np.sqrt(2)
+
+    perp_tr = np.array([-dir_tl_tr[1], dir_tl_tr[0]])
+    if np.dot(perp_tr, fp_tr - fp_bl) < 0:
+        perp_tr = -perp_tr
+    p3 = fp_tr + (dir_tl_tr + perp_tr) * ext / np.sqrt(2)
+
+    perp_bl = np.array([dir_tl_bl[1], -dir_tl_bl[0]])
+    if np.dot(perp_bl, fp_bl - fp_tr) < 0:
+        perp_bl = -perp_bl
+    p1 = fp_bl + (dir_tl_bl + perp_bl) * ext / np.sqrt(2)
+
+    p4 = p1 + p3 - p2
+    return p1, p2, p3, p4
+
+
+def edge_proj_score(gray, pts):
     h, w = gray.shape[:2]
-    pts = np.clip(np.float32(quad), [0, 0], [w - 1, h - 1])
+    pts = np.clip(np.float32(pts), [0, 0], [w - 1, h - 1])
     N = 100
-    dst = np.float32([[0, 0], [N - 1, 0], [N - 1, N - 1], [0, N - 1]])
+    dst = np.float32([[0, 0], [N-1, 0], [N-1, N-1], [0, N-1]])
     try:
-        warp = cv2.warpPerspective(
-            gray, cv2.getPerspectiveTransform(pts, dst), (N, N)
-        ).astype(np.float32)
+        M = cv2.getPerspectiveTransform(pts, dst)
+        warp = cv2.warpPerspective(gray, M, (N, N)).astype(np.float32)
     except cv2.error:
         return -1.0
     dy = np.abs(warp[1:] - warp[:-1])
@@ -159,41 +149,43 @@ def edge_proj_score(gray, quad):
     return float(np.std(dy.sum(1)) + np.std(dx.sum(0)))
 
 
-def refine_p4(gray, quad, p4_idx):
-    best = quad.copy()
-    best_score = edge_proj_score(gray, best)
+def refine_p4(gray, p1, p2, p3, p4, max_iters=10):
+    """
+    Refine P4 by maximizing std dev of edge projections (Karrach Section 4.1).
+    """
+    best_p4 = p4.copy()
+    quad = np.float32([p2, p3, p4, p1])
+    best_score = edge_proj_score(gray, quad)
+    step = 2.0
 
-    vec1 = quad[(p4_idx - 1) % 4] - quad[p4_idx]
-    vec2 = quad[(p4_idx + 1) % 4] - quad[p4_idx]
-    dir1 = vec1 / (np.linalg.norm(vec1) + 1e-8)
-    dir2 = vec2 / (np.linalg.norm(vec2) + 1e-8)
-    step = max(1.0, (np.linalg.norm(vec1) + np.linalg.norm(vec2)) / 100)
+    dir_v = (p3 - p4) / (np.linalg.norm(p3 - p4) + 1e-8)
+    dir_h = (p1 - p4) / (np.linalg.norm(p1 - p4) + 1e-8)
 
-    for direction in (dir1, dir2):
-        cur_dir = direction.copy()
-        cur_step = step
-        for _ in range(3):
-            if cur_step < 0.25:
-                break
-            misses = 0
-            for __ in range(20):
-                trial = best.copy()
-                trial[p4_idx] += cur_dir * cur_step
-                score = edge_proj_score(gray, trial)
-                if score > best_score:
-                    best_score = score
-                    best = trial
-                    misses = 0
-                else:
-                    misses += 1
-                    if misses >= 2:
-                        best[p4_idx] -= cur_dir * cur_step * 2
-                        best_score = edge_proj_score(gray, best)
-                        cur_dir = -cur_dir
-                        break
-            cur_step /= 2
-    return best
+    for _ in range(max_iters):
+        if step < 0.5:
+            break
+        improved = False
+        for d in [dir_v, -dir_v, dir_h, -dir_h]:
+            test = best_p4 + d * step
+            q = np.float32([p2, p3, test, p1])
+            s = edge_proj_score(gray, q)
+            if s > best_score:
+                best_score = s
+                best_p4 = test
+                improved = True
+        if not improved:
+            step /= 2
 
+    return best_p4
+
+
+def warp_to_square(image, p1, p2, p3, p4, size):
+    src = np.float32([p2, p3, p4, p1])
+    dst = np.float32([[0, 0], [size-1, 0], [size-1, size-1], [0, size-1]])
+    M, _ = cv2.findHomography(src, dst)
+    if M is None:
+        return None
+    return cv2.warpPerspective(image, M, (size, size))
 
 
 def rotate_crop(gray, poly):
@@ -223,24 +215,6 @@ def rotate_crop(gray, poly):
     x1 = min(int(new_ctr[0]) + half, new_w)
     crop = rotated[y0:y1, x0:x1]
     return crop if crop.size else None
-
-
-
-def to_gray(img):
-    if img.ndim == 3:
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return img
-
-
-def safe_crop(img, x1, y1, x2, y2, pad=0):
-    h, w = img.shape[:2]
-    x1 = max(0, int(x1) - pad)
-    y1 = max(0, int(y1) - pad)
-    x2 = min(w, int(x2) + pad)
-    y2 = min(h, int(y2) + pad)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return img[y1:y2, x1:x2]
 
 
 def try_decode(img):
@@ -279,13 +253,12 @@ def try_all_rotations(img):
     return None
 
 
-
 def decode_qr(frame, poly_xy, bbox):
     """
-    frame:   BGR or grayscale image
-    poly_xy: (N, 2) polygon from segmentation, or rectangle from bbox_to_polygon
-    bbox:    (x1, y1, x2, y2)
-    returns: decoded text or None
+    Full pipeline:
+      1) Rotate-crop (fast, works for mild tilt)
+      2) Finder-pattern homography (Karrach method, handles perspective)
+      3) Bbox crop fallback
     """
     poly = np.float32(poly_xy)
     side = int(max(cv2.minAreaRect(poly)[1]))
@@ -293,48 +266,28 @@ def decode_qr(frame, poly_xy, bbox):
         return None
     gray = to_gray(frame)
 
-    # 1) de-rotate and crop
+    # 1) rotate crop
     crop = rotate_crop(gray, poly)
     if crop is not None:
         text = try_decode(crop)
         if text:
             return text
 
-    # 2) perspective warp with finder-pattern P4 detection
-    quad = polygon_corners(poly)
-    if quad is None:
-        return None
+    # 2) finder-pattern based homography
+    fp = find_finder_patterns(gray, poly)
+    if fp is not None:
+        fp_tl, fp_tr, fp_bl = fp
+        p1, p2, p3, p4 = estimate_corners(fp_tl, fp_tr, fp_bl)
+        p4 = refine_p4(gray, p1, p2, p3, p4)
 
-    p4 = pick_p4(gray, quad)
-    refined = refine_p4(gray, quad, p4)
-    ordered = np.roll(refined, -((p4 - 2) % 4), axis=0)
-    big = expand_quad(ordered, 0.12)
-
-    result = None
-    for size in (side, int(side * 1.2), int(side * 0.8), 300):
-        warped = warp_quad(gray, big, size)
-        if warped is not None:
-            result = try_all_rotations(warped)
-            if result:
-                break
-
-    # 3) try each corner as P4
-    if not result:
-        for alt in range(4):
-            if alt == p4:
-                continue
-            alt_quad = expand_quad(
-                np.roll(quad, -((alt - 2) % 4), axis=0), 0.12)
-            warped = warp_quad(gray, alt_quad, side)
+        for sz in (side, int(side * 1.1), 300):
+            warped = warp_to_square(gray, p1, p2, p3, p4, sz)
             if warped is not None:
-                result = try_all_rotations(warped)
-                if result:
-                    break
+                text = try_all_rotations(warped)
+                if text:
+                    return text
 
-    if result:
-        return result
-
-    # 4) bbox crop fallback
+    # 3) bbox crop fallback
     x0, y0, x1, y1 = bbox
     pad = max(10, side // 8)
     crop = safe_crop(gray, x0, y0, x1, y1, pad=pad)
