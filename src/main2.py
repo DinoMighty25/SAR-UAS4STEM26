@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-# main.py, but using more robust QR decoding method along with existing precision land software.
-
 from picamera2 import Picamera2
 from picamera2.devices.imx500 import IMX500
 import cv2
@@ -216,17 +214,46 @@ def main():
     t = threading.Thread(target=decode_worker, args=(decode_q, result_holder, result_lock), daemon=True)
     t.start()
 
-    min_msg_interval = 1.0 / MESSAGE_RATE_HZ
-    last_msg_time = 0
-    last_heartbeat_time = 0
-    last_qr_send_time = 0
+    # last known landing target, shared with mavlink sender thread
+    target_lock = threading.Lock()
+    target_holder = {'data': None}  # (angle_x, angle_y, distance, size_x, size_y)
+    mavlink_running = threading.Event()
+    mavlink_running.set()
 
+    def mavlink_sender():
+        """Send landing_target + heartbeat at 30Hz, independent of camera FPS."""
+        last_hb = 0
+        while mavlink_running.is_set():
+            now = time.time()
+
+            if master and (now - last_hb) >= 1.0:
+                try:
+                    send_heartbeat(master)
+                except Exception:
+                    pass
+                last_hb = now
+
+            with target_lock:
+                data = target_holder['data']
+
+            if master and data is not None:
+                angle_x, angle_y, distance, size_x, size_y = data
+                try:
+                    send_landing_target(master, angle_x, angle_y, distance, size_x, size_y)
+                except Exception:
+                    pass
+
+            time.sleep(1.0 / 30)  # 30 Hz
+
+    mav_thread = threading.Thread(target=mavlink_sender, daemon=True)
+    mav_thread.start()
+
+    last_qr_send_time = 0
     frame_count = 0
     detection_count = 0
-    msg_count = 0
 
     print(f"fov: {math.degrees(CAMERA_HFOV):.1f} x {math.degrees(CAMERA_VFOV):.1f} deg")
-    print(f"qr size: {QR_SIZE_METERS}m | mavlink: {MESSAGE_RATE_HZ}hz")
+    print(f"qr size: {QR_SIZE_METERS}m | mavlink: 30hz (independent)")
     print("q to quit\n")
 
     try:
@@ -239,10 +266,6 @@ def main():
 
                 detections = parse_detections(imx, picam2, metadata, img_w, img_h)
                 current_time = time.time()
-
-                if master and (current_time - last_heartbeat_time) >= 1.0:
-                    send_heartbeat(master)
-                    last_heartbeat_time = current_time
 
                 if detections:
                     detection = detections[0]
@@ -267,21 +290,18 @@ def main():
                     if result:
                         angle_x, angle_y, distance, size_x, size_y = result
 
-                        if master and (current_time - last_msg_time) >= min_msg_interval:
-                            try:
-                                send_landing_target(master, angle_x, angle_y, distance, size_x, size_y)
-                                last_msg_time = current_time
-                                msg_count += 1
-                            except Exception:
-                                pass
+                        with target_lock:
+                            target_holder['data'] = (angle_x, angle_y, distance, size_x, size_y)
 
                         draw_detection(frame, detection, angle_x, angle_y, distance, decoded_text)
 
-                    cv2.putText(frame, f"detections: {detection_count}  msgs: {msg_count}",
+                    cv2.putText(frame, f"detections: {detection_count}",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 else:
                     with result_lock:
                         result_holder['text'] = None
+                    with target_lock:
+                        target_holder['data'] = None
                     cv2.putText(frame, "searching...",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
@@ -297,8 +317,9 @@ def main():
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
+        mavlink_running.clear()
         decode_q.put(None)
-        print(f"\n{frame_count} frames | {detection_count} detections | {msg_count} messages")
+        print(f"\n{frame_count} frames | {detection_count} detections")
         picam2.stop()
         cv2.destroyAllWindows()
         if master:
