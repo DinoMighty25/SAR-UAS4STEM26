@@ -22,14 +22,6 @@ def connect_pixhawk(port=PIXHAWK_PORT):
         )
         master.wait_heartbeat()
         print(f"pixhawk connected (target sysid {master.target_system})")
-
-        # disable Nagle buffering for TCP connections
-        import socket
-        try:
-            master.port.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception:
-            pass
-
         return master
     except Exception as e:
         print(f"warning: pixhawk not connected: {e}")
