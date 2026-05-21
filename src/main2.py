@@ -9,7 +9,7 @@ import time
 import math
 import numpy as np
 
-from qr_decode_with_warp import decode_qr, bbox_to_polygon, send_qr
+from qr_decode_simple import decode_qr, bbox_to_polygon, send_qr
 from precision_land import *
 
 CONFIDENCE_THRESHOLD = 0.3
