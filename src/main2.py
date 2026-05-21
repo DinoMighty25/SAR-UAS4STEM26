@@ -220,34 +220,6 @@ def main():
     mavlink_running = threading.Event()
     mavlink_running.set()
 
-    def mavlink_sender():
-        """Send landing_target + heartbeat at 30Hz, independent of camera FPS."""
-        last_hb = 0
-        while mavlink_running.is_set():
-            now = time.time()
-
-            if master and (now - last_hb) >= 1.0:
-                try:
-                    send_heartbeat(master)
-                except Exception:
-                    pass
-                last_hb = now
-
-            with target_lock:
-                data = target_holder['data']
-
-            if master and data is not None:
-                angle_x, angle_y, distance, size_x, size_y = data
-                try:
-                    send_landing_target(master, angle_x, angle_y, distance, size_x, size_y)
-                except Exception:
-                    pass
-
-            time.sleep(1.0 / 30)  # 30 Hz
-
-    mav_thread = threading.Thread(target=mavlink_sender, daemon=True)
-    mav_thread.start()
-
     last_qr_send_time = 0
     frame_count = 0
     detection_count = 0
