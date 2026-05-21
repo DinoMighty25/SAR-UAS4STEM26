@@ -1,6 +1,8 @@
 # SAR-UAS4STEM26
 Some Assembly Required's GitHub repository for the 25-26 UAS4STEM season
 
+*use main2.py, which uses precision_land.py and qr_decode_simple.py*
+
 ## Current progress (4/1/26)
 Files have been split into a precision land, QR decode, and main file under /src. The /models directory contains the .rpk model used in the current decode QR code script. Another model, this time trained for instance segmentation, was uploaded and converted to the IMX500 format to be run on the AI camera. This segmentation will hopefully make it easier to manipulate the segmented area for easier QR decoding.
 
