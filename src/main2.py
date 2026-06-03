@@ -15,6 +15,16 @@ from precision_land import *
 CONFIDENCE_THRESHOLD = 0.3
 MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
 
+pinger = threading.Thread(target=ping_system, daemon=True)
+pinger.start()
+
+def ping():
+    while True:
+        master.mav.statustext_send(
+            mavutil.mavlink.MAV_SEVERITY_WARNING,
+            "software connected"
+        )
+        time.sleep(3)
 
 def initialize_imx500(model_path):
     print("loading model...")
