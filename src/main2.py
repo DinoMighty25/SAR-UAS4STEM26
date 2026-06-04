@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# during AI testing in-flight, ensure headless mode is on (comment out cv2.imshow)
 
 from picamera2 import Picamera2
 from picamera2.devices.imx500 import IMX500
