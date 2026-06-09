@@ -267,6 +267,7 @@ def main():
 
                     if decoded_text and master and (current_time - last_qr_send_time) >= 2.0:
                         send_qr(decoded_text, master)
+                        send_landing_target(master, angle_x, angle_y, distance, size_x, size_y)
                         last_qr_send_time = current_time
 
                     result = calculate_landing_target(detection, img_w, img_h)
