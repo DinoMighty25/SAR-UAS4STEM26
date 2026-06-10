@@ -8,7 +8,8 @@ CAMERA_HFOV = math.radians(78)
 CAMERA_VFOV = math.radians(60)
 QR_SIZE_METERS = 0.2
 
-PIXHAWK_PORT = 'udpout:192.168.1.193:14550'
+PIXHAWK_PORT = '/dev/serial0'
+BAUD = 57600
 MESSAGE_RATE_HZ = 10
 
 
@@ -17,6 +18,7 @@ def connect_pixhawk(port=PIXHAWK_PORT):
     try:
         master = mavutil.mavlink_connection(
             port,
+            baud=BAUD,
             source_system=2,
             source_component=191
         )
