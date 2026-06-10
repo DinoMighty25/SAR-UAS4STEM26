@@ -212,6 +212,15 @@ def decode_worker(decode_q, result_holder, result_lock):
             continue
         except Exception as e:
             print(f"decode error: {e}")
+            
+def mavlink_sender(master, target_lock, target_holder, mavlink_running, hz=30):
+    period = 1.0 / hz
+    while mavlink_running.is_set():
+        with target_lock:
+            data = target_holder['data']
+        if data and master:
+            send_landing_target(master, *data)
+        time.sleep(period)
 
 
 def main():
@@ -238,6 +247,13 @@ def main():
     print(f"fov: {math.degrees(CAMERA_HFOV):.1f} x {math.degrees(CAMERA_VFOV):.1f} deg")
     print(f"qr size: {QR_SIZE_METERS}m | mavlink: 30hz (independent)")
     print("q to quit\n")
+
+    sender = threading.Thread(
+        target=mavlink_sender,
+        args=(master, target_lock, target_holder, mavlink_running),
+        daemon=True,
+    )
+    sender.start()
 
     try:
         while True:
@@ -267,7 +283,6 @@ def main():
 
                     if decoded_text and master and (current_time - last_qr_send_time) >= 2.0:
                         send_qr(decoded_text, master)
-                        send_landing_target(master, angle_x, angle_y, distance, size_x, size_y)
                         last_qr_send_time = current_time
 
                     result = calculate_landing_target(detection, img_w, img_h)
