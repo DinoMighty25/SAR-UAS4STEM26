@@ -215,11 +215,25 @@ def decode_worker(decode_q, result_holder, result_lock):
             
 def mavlink_sender(master, target_lock, target_holder, mavlink_running, hz=30):
     period = 1.0 / hz
+    iters = sent = 0
+    t0 = time.time()
     while mavlink_running.is_set():
+        iters += 1
         with target_lock:
             data = target_holder['data']
         if data and master:
-            send_landing_target(master, *data)
+            t_w = time.time()
+            with send_lock:
+                send_landing_target(master, *data)
+            dt = time.time() - t_w
+            if dt > 0.05:
+                print(f"slow write: {dt*1000:.0f}ms")
+            sent += 1
+        now = time.time()
+        if now - t0 >= 1.0:
+            print(f"sender: {iters} iters/s, {sent} sends/s, data={'y' if data else 'None'}")
+            iters = sent = 0
+            t0 = now
         time.sleep(period)
 
 
@@ -254,6 +268,8 @@ def main():
         daemon=True,
     )
     sender.start()
+
+    loop_start = time.time()
 
     try:
         while True:
@@ -306,6 +322,8 @@ def main():
 
                 cv2.imshow('QR landing target', frame)
                 frame_count += 1
+                if frame_count % 30 == 0:
+                    print(f"loop fps ~{frame_count / (time.time() - loop_start):.1f}")
 
             finally:
                 request.release()
