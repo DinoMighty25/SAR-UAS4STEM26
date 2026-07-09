@@ -6,7 +6,7 @@ import math
 
 CAMERA_HFOV = math.radians(78)
 CAMERA_VFOV = math.radians(60)
-QR_SIZE_METERS = 0.2
+QR_SIZE_METERS = 0.914
 
 PIXHAWK_PORT = '/dev/serial0'
 BAUD = 57600

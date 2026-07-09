@@ -14,7 +14,9 @@ from qr_decode_simple import decode_qr, bbox_to_polygon, send_qr
 from precision_land import *
 
 CONFIDENCE_THRESHOLD = 0.3
-MODEL_PATH = "/home/drone/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
+MODEL_PATH = "/home/dev/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
+
+send_lock = threading.Lock()
 
 # def ping():
 #     while True:
@@ -308,7 +310,7 @@ def main():
                     cv2.putText(frame, "searching...",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                cv2.imshow('QR landing target', frame)
+                #cv2.imshow('QR landing target', frame)
                 frame_count += 1
                 if frame_count % 30 == 0:
                     print(f"loop fps ~{frame_count / (time.time() - loop_start):.1f}")
@@ -326,7 +328,7 @@ def main():
         decode_q.put(None)
         print(f"\n{frame_count} frames | {detection_count} detections")
         picam2.stop()
-        cv2.destroyAllWindows()
+        #cv2.destroyAllWindows()
         if master:
             master.close()
 
