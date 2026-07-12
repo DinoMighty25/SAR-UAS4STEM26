@@ -4,8 +4,8 @@ from pymavlink import mavutil
 import time
 import math
 
-CAMERA_HFOV = math.radians(78)
-CAMERA_VFOV = math.radians(60)
+CAMERA_HFOV = math.radians(66)
+CAMERA_VFOV = math.radians(40.4)
 QR_SIZE_METERS = 0.914
 
 PIXHAWK_PORT = '/dev/serial0'
@@ -38,24 +38,44 @@ def send_heartbeat(master):
     )
 
 
-def calculate_landing_target(detection, img_width, img_height):
+# def calculate_landing_target(detection, img_width, img_height):
+#     cx, cy = detection['center']
+#     width, height = detection['size']
+
+#     if width <= 0 or height <= 0:
+#         return None
+
+#     offset_x = (cx - img_width / 2) / (img_width / 2)
+#     offset_y = (cy - img_height / 2) / (img_height / 2)
+
+#     angle_x = offset_x * (CAMERA_HFOV / 2)
+#     angle_y = offset_y * (CAMERA_VFOV / 2)
+
+#     size_x = (width / img_width) * CAMERA_HFOV
+#     size_y = (height / img_height) * CAMERA_VFOV
+
+#     focal_length_px = (img_width / 2) / math.tan(CAMERA_HFOV / 2)
+#     distance = (QR_SIZE_METERS * focal_length_px) / width
+
+#     return angle_x, angle_y, distance, size_x, size_y
+def calculate_landing_target(detection, img_width, img_height, rel_alt=None):
     cx, cy = detection['center']
     width, height = detection['size']
-
     if width <= 0 or height <= 0:
         return None
 
-    offset_x = (cx - img_width / 2) / (img_width / 2)
-    offset_y = (cy - img_height / 2) / (img_height / 2)
+    focal_px = (img_width / 2) / math.tan(CAMERA_HFOV / 2)
 
-    angle_x = offset_x * (CAMERA_HFOV / 2)
-    angle_y = offset_y * (CAMERA_VFOV / 2)
+    angle_x = math.atan((cx - img_width / 2) / focal_px)
+    angle_y = math.atan((cy - img_height / 2) / focal_px)
 
     size_x = (width / img_width) * CAMERA_HFOV
     size_y = (height / img_height) * CAMERA_VFOV
 
-    focal_length_px = (img_width / 2) / math.tan(CAMERA_HFOV / 2)
-    distance = (QR_SIZE_METERS * focal_length_px) / width
+    if rel_alt is not None and rel_alt > 0.5:
+        distance = rel_alt * math.sqrt(1 + math.tan(angle_x)**2 + math.tan(angle_y)**2)
+    else:
+        distance = (QR_SIZE_METERS * focal_px) / width
 
     return angle_x, angle_y, distance, size_x, size_y
 
@@ -75,3 +95,21 @@ def send_landing_target(master, angle_x, angle_y, distance, size_x, size_y):
     except Exception as e:
         print(f"mavlink error: {e}")
         raise
+
+# for altitude
+
+def request_altitude_stream(master):
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+        mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+        200000, 0, 0, 0, 0, 0)  # 5 Hz
+
+
+def altitude_listener(master, alt_holder, alt_lock, running):
+    while running.is_set():
+        msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+        if msg:
+            with alt_lock:
+                alt_holder['alt'] = msg.relative_alt / 1000.0
+                alt_holder['time'] = time.time()
