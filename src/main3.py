@@ -10,8 +10,8 @@ import time
 import math
 import numpy as np
 
-from qr_decode_simple import decode_qr, bbox_to_polygon, send_qr
-from precision_land import *
+from qr_decode_simple2 import decode_qr, bbox_to_polygon, send_qr
+from precision_land2 import *
 
 CONFIDENCE_THRESHOLD = 0.3
 MODEL_PATH = "/home/dev/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_output/network.rpk"
