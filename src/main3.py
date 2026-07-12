@@ -234,6 +234,9 @@ def main():
     imx = initialize_imx500(MODEL_PATH)
     picam2 = setup_camera(imx)
     master = connect_pixhawk()
+
+    mavlink_running = threading.Event()
+    mavlink_running.set()
     #---
     alt_holder = {'alt': None, 'time': 0.0}
     alt_lock = threading.Lock()
@@ -254,8 +257,7 @@ def main():
     # last known landing target, shared with mavlink sender thread
     target_lock = threading.Lock()
     target_holder = {'data': None, 'time': 0.0}  # (angle_x, angle_y, distance, size_x, size_y)
-    mavlink_running = threading.Event()
-    mavlink_running.set()
+    
     #---
     if master:
         alt_thread.start()
