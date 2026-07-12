@@ -18,16 +18,6 @@ MODEL_PATH = "/home/dev/SAR-UAS4STEM26/models/qr_seg_imx_export/qr_seg_imx_outpu
 
 send_lock = threading.Lock()
 
-# def ping():
-#     while True:
-#         master.mav.statustext_send(
-#             mavutil.mavlink.MAV_SEVERITY_WARNING,
-#             "software connected"
-#         )
-#         time.sleep(3)
-
-# pinger = threading.Thread(target=ping, daemon=True)
-# pinger.start()
 
 def initialize_imx500(model_path):
     print("loading model...")
@@ -215,16 +205,28 @@ def decode_worker(decode_q, result_holder, result_lock):
         except Exception as e:
             print(f"decode error: {e}")
             
+# def mavlink_sender(master, target_lock, target_holder, mavlink_running, hz=30):
+#     period = 1.0 / hz
+#     TARGET_TIMEOUT = 0.5
+#     while mavlink_running.is_set():
+#         with target_lock:
+#             data = target_holder['data']
+#             ts = target_holder['time']
+#         if data and master and (time.time() - ts) <= TARGET_TIMEOUT:
+#             with send_lock:
+#                 send_landing_target(master, *data)
+#         time.sleep(period)
 def mavlink_sender(master, target_lock, target_holder, mavlink_running, hz=30):
     period = 1.0 / hz
-    TARGET_TIMEOUT = 0.5
+    last_sent = 0.0
     while mavlink_running.is_set():
         with target_lock:
             data = target_holder['data']
             ts = target_holder['time']
-        if data and master and (time.time() - ts) <= TARGET_TIMEOUT:
+        if data and master and ts > last_sent:
             with send_lock:
                 send_landing_target(master, *data)
+            last_sent = ts
         time.sleep(period)
 
 
@@ -232,6 +234,16 @@ def main():
     imx = initialize_imx500(MODEL_PATH)
     picam2 = setup_camera(imx)
     master = connect_pixhawk()
+    #---
+    alt_holder = {'alt': None, 'time': 0.0}
+    alt_lock = threading.Lock()
+    if master:
+        request_altitude_stream(master)
+        alt_thread = threading.Thread(
+            target=altitude_listener,
+            args=(master, alt_holder, alt_lock, mavlink_running),
+            daemon=True)
+    #---
 
     decode_q = queue.Queue(maxsize=1)
     result_holder = {'text': None}
@@ -244,6 +256,10 @@ def main():
     target_holder = {'data': None, 'time': 0.0}  # (angle_x, angle_y, distance, size_x, size_y)
     mavlink_running = threading.Event()
     mavlink_running.set()
+    #---
+    if master:
+        alt_thread.start()
+    #---
 
     last_qr_send_time = 0
     frame_count = 0
@@ -292,7 +308,12 @@ def main():
                         send_qr(decoded_text, master)
                         last_qr_send_time = current_time
 
-                    result = calculate_landing_target(detection, img_w, img_h)
+                    #result = calculate_landing_target(detection, img_w, img_h)
+
+                    with alt_lock:
+                        rel_alt = alt_holder['alt'] if (time.time() - alt_holder['time']) < 2.0 else None
+                    result = calculate_landing_target(detection, img_w, img_h, rel_alt)
+                    
                     if result:
                         angle_x, angle_y, distance, size_x, size_y = result
 
