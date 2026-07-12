@@ -304,7 +304,7 @@ def main():
                         pass
 
                     with result_lock:
-                        decoded_text = result_holder['text']
+                        send_qr(decoded_text, master)
 
                     if decoded_text and master and (current_time - last_qr_send_time) >= 2.0:
                         send_qr(decoded_text, master)
