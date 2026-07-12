@@ -304,12 +304,12 @@ def main():
                         pass
 
                     with result_lock:
-                        send_qr(decoded_text, master)
+                        decoded_text = result_holder['text']
 
                     if decoded_text and master and (current_time - last_qr_send_time) >= 2.0:
-                        send_qr(decoded_text, master)
+                        with send_lock:
+                            send_qr(decoded_text, master)
                         last_qr_send_time = current_time
-
                     #result = calculate_landing_target(detection, img_w, img_h)
 
                     with alt_lock:
