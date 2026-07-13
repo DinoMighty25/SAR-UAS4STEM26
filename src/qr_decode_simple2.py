@@ -3,6 +3,10 @@ import numpy as np
 from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
 from pymavlink import mavutil
 
+# pyzbar needs QR modules >= ~2px; upscale crops smaller than this
+UPSCALE_BELOW_PX = 150
+UPSCALE_TARGET_PX = 300
+
 
 def to_gray(img):
     if img.ndim == 3:
@@ -57,53 +61,82 @@ def rotate_crop(gray, poly):
     return crop if crop.size else None
 
 
+# --- preprocessing strategies -------------------------------------------
+# Each takes a grayscale image, returns an image to hand to pyzbar
+# (or None if not applicable). Order = original fixed order.
+
+def _raw(gray):
+    return gray
+
+
+def _otsu(gray):
+    _, out = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return out
+
+
+def _blur_otsu(gray):
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, out = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return out
+
+
+def _adaptive(gray):
+    if gray.shape[0] <= 30:
+        return None
+    block = min(51, max(3, (min(gray.shape[:2]) // 4) | 1))
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, block, 10)
+
+
+def _clahe_otsu(gray):
+    # handles uneven drone lighting
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
+    _, out = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return out
+
+
+def _sharpen_otsu(gray):
+    # helps with motion blur at altitude
+    kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]], dtype=np.float32)
+    sharp = cv2.filter2D(gray, -1, kernel)
+    _, out = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return out
+
+
+_STRATEGIES = [_raw, _otsu, _blur_otsu, _adaptive, _clahe_otsu, _sharpen_otsu]
+
+# index of the strategy that succeeded most recently; tried first next time.
+# consecutive frames share the same lighting, so this usually hits on
+# attempt 1 instead of attempt N. (only touched by the decode thread.)
+_last_good = [0]
+
+
 def try_decode(img):
-    """Decode a QR image with multiple preprocessing strategies."""
+    """Decode a QR image, trying the last successful strategy first."""
     if img is None or img.size == 0:
         return None
     gray = to_gray(img)
 
-    # raw
-    hits = pyzbar_decode(img, symbols=[ZBarSymbol.QRCODE])
-    if hits:
-        return hits[0].data.decode("utf-8")
+    # upscale small crops: pyzbar fails when QR modules are < ~2px.
+    # cheap because the crop is small by definition.
+    h, w = gray.shape[:2]
+    short_side = min(h, w)
+    if 0 < short_side < UPSCALE_BELOW_PX:
+        scale = UPSCALE_TARGET_PX / short_side
+        gray = cv2.resize(gray, None, fx=scale, fy=scale,
+                          interpolation=cv2.INTER_CUBIC)
 
-    # otsu
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    hits = pyzbar_decode(otsu, symbols=[ZBarSymbol.QRCODE])
-    if hits:
-        return hits[0].data.decode("utf-8")
+    first = _last_good[0]
+    order = [first] + [i for i in range(len(_STRATEGIES)) if i != first]
 
-    # blur + otsu
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, blur_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    hits = pyzbar_decode(blur_otsu, symbols=[ZBarSymbol.QRCODE])
-    if hits:
-        return hits[0].data.decode("utf-8")
-
-    # adaptive threshold
-    if gray.shape[0] > 30:
-        block = min(51, max(3, (min(gray.shape[:2]) // 4) | 1))
-        adapt = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, block, 10)
-        hits = pyzbar_decode(adapt, symbols=[ZBarSymbol.QRCODE])
+    for idx in order:
+        proc = _STRATEGIES[idx](gray)
+        if proc is None:
+            continue
+        hits = pyzbar_decode(proc, symbols=[ZBarSymbol.QRCODE])
         if hits:
+            _last_good[0] = idx
             return hits[0].data.decode("utf-8")
-
-    # CLAHE + otsu (handles uneven drone lighting)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(gray)
-    _, clahe_otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    hits = pyzbar_decode(clahe_otsu, symbols=[ZBarSymbol.QRCODE])
-    if hits:
-        return hits[0].data.decode("utf-8")
-
-    # sharpen + otsu (helps with motion blur at altitude)
-    kernel = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]], dtype=np.float32)
-    sharp = cv2.filter2D(gray, -1, kernel)
-    _, sharp_otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    hits = pyzbar_decode(sharp_otsu, symbols=[ZBarSymbol.QRCODE])
-    if hits:
-        return hits[0].data.decode("utf-8")
 
     return None
 
@@ -155,7 +188,7 @@ def send_qr(url, master):
         msg = "TOWER"
     elif "MOVING-TARGET" in msg:
         msg = "MOVING-TARGET"
-    elif "dHrQl" in msg:
+    elif "DHRQL" in msg:  # was "dHrQl": could never match an uppercased string
         msg = "STATIONARY-TARGET"
     elif "BALLPEEN" in msg:
         msg = "BALLPEEN-HAMMER"
