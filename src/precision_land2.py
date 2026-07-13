@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
-#   PLND_ENABLED  = 1
-#   PLND_TYPE     = 1  
-#   PLND_EST_TYPE = 1   
-#   PLND_LAG      = your camera->mavlink latency in seconds (~0.10, measure it)
-#   LAND_SPEED    = 30-50 (cm/s, slow final descent)
+# PLND_ENABLED   = 1
+# PLND_TYPE      = 1       # companion computer
+# PLND_EST_TYPE  = 1       # Kalman filter back on
+# PLND_LAG       = 0.10    # estimate; measure later if wobble persists
+# PLND_OPTIONS   = 1       # moving target support (hat delivery)
+# PLND_XY_DIST_MAX = 5     # meters; allows reacquisition from further off
+# LAND_SPEED     = 40      # cm/s final descent
+# RCx_OPTION     = 39      # precision loiter on pilot's switch (x = your channel)
 
 from pymavlink import mavutil
 from collections import deque
