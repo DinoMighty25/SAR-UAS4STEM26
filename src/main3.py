@@ -225,7 +225,9 @@ def mavlink_sender(master, target_lock, target_holder, mavlink_running, hz=30):
             ts = target_holder['time']
         if data and master and ts > last_sent:
             with send_lock:
-                send_landing_target(master, *data)
+                # ts is the frame CAPTURE time -> lets ArduPilot (PLND_LAG)
+                # match the measurement to the right vehicle attitude
+                send_landing_target(master, *data, time_usec=int(ts * 1e6))
             last_sent = ts
         time.sleep(period)
 
@@ -257,7 +259,11 @@ def main():
     # last known landing target, shared with mavlink sender thread
     target_lock = threading.Lock()
     target_holder = {'data': None, 'time': 0.0}  # (angle_x, angle_y, distance, size_x, size_y)
-    
+
+    # learns the QR's real physical size while altitude is trusted,
+    # so low-altitude pinhole works for any mat size
+    size_est = QRSizeEstimator()
+
     #---
     if master:
         alt_thread.start()
@@ -291,6 +297,13 @@ def main():
                 detections = parse_detections(imx, picam2, metadata, img_w, img_h)
                 current_time = time.time()
 
+                # actual frame capture time (SensorTimestamp is ns since boot)
+                sensor_ts = metadata.get('SensorTimestamp')
+                if sensor_ts:
+                    capture_time = current_time - (time.monotonic_ns() - sensor_ts) / 1e9
+                else:
+                    capture_time = current_time
+
                 if detections:
                     detection = detections[0]
                     detection_count += 1
@@ -314,14 +327,14 @@ def main():
 
                     with alt_lock:
                         rel_alt = alt_holder['alt'] if (time.time() - alt_holder['time']) < 2.0 else None
-                    result = calculate_landing_target(detection, img_w, img_h, rel_alt)
-                    
+                    result = calculate_landing_target(detection, img_w, img_h, rel_alt, size_est)
+
                     if result:
                         angle_x, angle_y, distance, size_x, size_y = result
 
                         with target_lock:
                             target_holder['data'] = (angle_x, angle_y, distance, size_x, size_y)
-                            target_holder['time'] = current_time
+                            target_holder['time'] = capture_time
 
                         draw_detection(frame, detection, angle_x, angle_y, distance, decoded_text)
 
@@ -336,7 +349,9 @@ def main():
                 #cv2.imshow('QR landing target', frame)
                 frame_count += 1
                 if frame_count % 30 == 0:
-                    print(f"loop fps ~{frame_count / (time.time() - loop_start):.1f}")
+                    qr_est = size_est.get()
+                    est_str = f"{qr_est:.3f}m" if qr_est else "learning..."
+                    print(f"loop fps ~{frame_count / (time.time() - loop_start):.1f} | qr size est: {est_str}")
 
             finally:
                 request.release()
