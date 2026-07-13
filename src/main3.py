@@ -34,6 +34,15 @@ def setup_camera(imx):
     )
     imx.show_network_fw_progress_bar()
     picam2.configure(config)
+    # bias auto-exposure toward SHORT exposure times (higher gain instead):
+    # motion blur is the #1 QR decode killer on a moving drone, and no
+    # amount of post-processing can undo it. grain is fine, blur is fatal.
+    try:
+        from libcamera import controls
+        picam2.set_controls({"AeExposureMode": controls.AeExposureModeEnum.Short})
+        print("exposure mode: short (anti motion blur)")
+    except Exception as e:
+        print(f"warning: could not set short exposure mode: {e}")
     picam2.start()
     time.sleep(2)
     print("camera ready")
