@@ -341,8 +341,8 @@ def main():
             finally:
                 request.release()
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            # if cv2.waitKey(1) & 0xFF == ord('q'):
+            #     break
 
     except KeyboardInterrupt:
         print("\nstopped")
