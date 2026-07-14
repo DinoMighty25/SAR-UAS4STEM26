@@ -167,8 +167,12 @@ def request_altitude_stream(master):
 
 def altitude_listener(master, alt_holder, alt_lock, running):
     while running.is_set():
-        msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
-        if msg:
-            with alt_lock:
-                alt_holder['alt'] = msg.relative_alt / 1000.0
-                alt_holder['time'] = time.time()
+        try:
+            msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+            if msg:
+                with alt_lock:
+                    alt_holder['alt'] = msg.relative_alt / 1000.0
+                    alt_holder['time'] = time.time()
+        except Exception as e:
+            print(f"alt listener error: {e}")
+            time.sleep(0.5)
