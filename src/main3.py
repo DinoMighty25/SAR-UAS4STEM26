@@ -11,6 +11,9 @@ import traceback
 from datetime import datetime
 import numpy as np
 
+from picamera2 import Picamera2
+from picamera2.devices.imx500 import IMX500
+
 from qr_decode_simple2 import decode_qr, bbox_to_polygon, send_qr
 from precision_land2 import *
 
