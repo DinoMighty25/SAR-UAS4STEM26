@@ -152,7 +152,7 @@ def send_landing_target(master, angle_x, angle_y, distance, size_x, size_y,
         )
     except Exception as e:
         print(f"mavlink error: {e}")
-        raise
+    
 
 
 # for altitude
