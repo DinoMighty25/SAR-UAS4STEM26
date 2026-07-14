@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # during AI testing in-flight, ensure headless mode is on (comment out cv2.imshow)
 
-from picamera2 import Picamera2
-from picamera2.devices.imx500 import IMX500
 import cv2
 import threading
 import queue
 import time
 import math
+import sys
+import traceback
+from datetime import datetime
 import numpy as np
 
 from qr_decode_simple2 import decode_qr, bbox_to_polygon, send_qr
@@ -358,12 +359,17 @@ def main():
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 #cv2.imshow('QR landing target', frame)
+                #cv2.imshow('QR landing target', frame)
                 frame_count += 1
                 if frame_count % 30 == 0:
                     qr_est = size_est.get()
                     est_str = f"{qr_est:.3f}m" if qr_est else "learning..."
                     print(f"loop fps ~{frame_count / (time.time() - loop_start):.1f} | qr size est: {est_str}")
 
+            except Exception as e:
+                print(f"frame error: {e}")
+                traceback.print_exc()
+                time.sleep(0.05)
             finally:
                 request.release()
 
@@ -374,12 +380,21 @@ def main():
         print("\nstopped")
     finally:
         mavlink_running.clear()
-        decode_q.put(None)
+        try:
+            decode_q.put_nowait(None)
+        except queue.Full:
+            pass
         print(f"\n{frame_count} frames | {detection_count} detections")
-        picam2.stop()
+        try:
+            picam2.stop()
+        except Exception as e:
+            print(f"picam2.stop failed: {e}")
         #cv2.destroyAllWindows()
-        if master:
-            master.close()
+        try:
+            if master:
+                master.close()
+        except Exception as e:
+            print(f"master.close failed: {e}")
 
 
 if __name__ == '__main__':
