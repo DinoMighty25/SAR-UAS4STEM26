@@ -397,5 +397,30 @@ def main():
             print(f"master.close failed: {e}")
 
 
+LOG_PATH = "/home/dev/sar_crash.log"
+
+def _log(msg):
+    line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def _thread_excepthook(args):
+    _log(f"THREAD CRASH in {args.thread.name}:\n" + "".join(
+        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
 if __name__ == '__main__':
-    main()
+    threading.excepthook = _thread_excepthook
+    _log(f"=== start {sys.argv[0]} ===")
+    try:
+        main()
+    except KeyboardInterrupt:
+        _log("interrupted by user")
+    except BaseException:
+        _log("FATAL:\n" + traceback.format_exc())
+        sys.exit(1)
+    finally:
+        _log("=== exit ===")
